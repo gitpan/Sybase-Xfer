@@ -1,7 +1,7 @@
 #
 #extract name, type, len from a sybase database given a list of tables
 #
-# $Id: ObjectInfo.pm,v 1.5 2001/02/11 17:53:54 spragues Exp $
+# $Id: ObjectInfo.pm,v 1.5 2001/02/11 17:53:54 spragues Exp spragues $
 #
 # (c) 1999, 2000 Morgan Stanley Dean Witter and Co.
 # See ..../src/LICENSE for terms of distribution.
@@ -132,10 +132,16 @@ EOF
 
          }
 
+#add the list column names in the right order
+         @{ $info{$db_name}->{$tab_name}->{__COLNAMES__} } =
+         sort { $info{$db_name}->{$tab_name}->{$a}->{col_id} <=>
+                $info{$db_name}->{$tab_name}->{$b}->{col_id} 
+              } keys %{ $info{$db_name}->{$tab_name} };
 
       }
 
-#      bless %info;
+
+#      bless \%info;
       return %info;
    }
 __END__
@@ -163,7 +169,11 @@ Sybase::ObjectInfo - Return Sybase Object information
       ->{col_allownulls}  # does the column allow nulls
       ->{col_usertype}    # column usertype - if applicable
       ->{col_prec}        # column precision
+      ->{col_order}       # an array of the columns names in order
 
+   and per table:
+     $info{$db_name}->{$table_name}->{__COLNAMES__} #an array of the column names in order
+ 
 
 =head1 DEPENDENCIES
 
@@ -231,8 +241,14 @@ stephen.sprague@msdw.com
 
 =head1 VERSION
 
-version 0.1, 01-OCT-2000
-version 0.2, 10-FEB-2000
+Version 0.21  24-FEB-2001
+      Added return key '{__COLNAMES__}'
 
+Version 0.20  10-FEB-2001
+      Documentation/pod changes only
+
+version 0.1, 01-OCT-2000
+      Created
 =cut
+
 1;

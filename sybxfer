@@ -1,18 +1,17 @@
-#!/ms/dist/perl5/bin/perl5.005
+#!/ms/dist/perl5/bin/perl5.005 
 #
-# $Id: sybxfer,v 1.7 2000/12/13 06:17:29 spragues Exp $
+# $Id: sybxfer,v 1.9 2001/03/06 02:11:37 spragues Exp spragues $
 #
 #
 #driver script for Sybase::Xfer.pm
 #
 #
 
-
 #modules
    use Sybase::Xfer;
    
 #init it
-   my $xf = new Sybase::Xfer(@ARGV);
+   my $xf = Sybase::Xfer->new(@ARGV, -sybxfer=>1) || exit 1 ;
 
 #run it
    exit $xf->xfer();
