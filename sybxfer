@@ -1,4 +1,4 @@
-#!/ms/dist/perl5/bin/perl5.005 
+#!/ms/dist/perl5/bin/perl5.6
 #
 # $Id: sybxfer,v 1.11 2001/04/30 02:59:18 spragues Exp spragues $
 #
@@ -6,12 +6,12 @@
 #driver script for Sybase::Xfer.pm
 #
 #
-
 #modules
    use Sybase::Xfer;
    
 #init it
    my $xf = Sybase::Xfer->new(@ARGV, -sybxfer=>1) or exit 1;
+
 
 #run it
    my %rs = $xf->xfer(-return=>'HASH');

@@ -41,8 +41,102 @@ CONTACTS
 
 
 CHANGE LOG:
+-----------------------
+Version 0.62  01-MAR-2003  It Lives!!!
+-----------------------
+* added switch --textsize for use with 
+  bulk inserting text/images.
+  (rocco ditaranto & jon freeman)
+
+* fixed binary/varbinary/image/timestamp column 
+  xfer bug.  (rocco ditaranto)
+
+* added switch --packetsize for potentially
+  increasing bulk insert performance. 
+
+* fixed bug with Sybase::ObjectInfo.pm where
+  allownulls was always returning true.
+  (chris anecelle)
+
+* fixed bug with misreporting a float that
+  underflowed/overflowed was due to non-numeric
+  data.(Harjit Johal)
+
+* made Xfer.pm warnings (-w) compliant.
+  (Jun Wu)
+
+* fixed bug with specifying shortcut switches 
+  -T & -D for both source and target.
+
+* removed dependency on DBD::Sybase. Seems it
+  didn't play nice with Sybase::CTlib under some
+  conditions. 
+
+* fixed bug with xferring identity columns and
+  requesting the target server to create new ones.
+  ie. xfer now undef's the corresponding value.
+
+* xfer now explicitly extends the input record
+  with undef's if it's shorter than the target
+  table.
+
+
+pending:
+   * new switch --method {bcp | insert | sybbcp}  
+     (andrew lowery)
+
+   * new switch --filter "{ regex[N] => '[!] /expr/',
+                            firstrow => n,
+                            maxrows  => n}"
+
+     if regex specified w/o N, then it is applied to each
+     column of each row. if regex is specifed with N it is
+     applied to that column only where N is the column number
+     in target table.  (khalid taha)
+
+   * db2 support 
+
+
+
+
 ------------------------
-Version 0.51  15-jun-2001
+Version 0.53  07-NOV-2001
+------------------------
+* added "sysUser=>u, sysPwd=>p" to the -truncate
+  and -drop_and_recreate_indices switches.
+  This is useful if the bcp needs to be run under a
+  different user than the truncate/create indices
+  user.  (abhijit subhedar)
+
+* added optimization to -delete, -truncate, and
+  -auto_delete logic to skip operation if target
+  table empty. (joe melillo)
+
+* added logic to -from_file s/t if file ends in .gz/.ZIP
+  to pipe through zcat. (khalid taha)
+
+* added new switch -from_file_pack_format 'format'. Where
+  format is passed to the unpack command to determine the
+  fields to transfer to target. This switch is mutex with
+  -from_file_delimeter. (mark dootson)
+
+
+------------------------
+Version 0.52  10-SEP-2001
+------------------------
+* corrected more errors in deadlock retry logic (Tom Cornell)
+  a) {ok} hash status wasn't properly set
+  b) rows transferred to target incorrectly set
+ 
+* -from_file can now accept a reference  (Graham Ward)
+  if reference subclassed from IO::File then xfer will
+  read input from it. Useful for reading from sockets.
+  
+
+
+
+------------------------
+Version 0.51  15-JUN-2001
 ------------------------
 * added -to_database documentation (Suresh Balakrishnan)
 

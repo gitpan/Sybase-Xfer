@@ -3,16 +3,15 @@
 # (c) 1999, 2000 Morgan Stanley Dean Witter and Co.
 # See ..../src/LICENSE for terms of distribution.
 #
-#Transfer data between two Sybase servers in memory
 #
 #See pod documentation at the end of this file
 # 
+#
 #reminder. when updating documentation:
 #   1) usage
 #   2) short usage
 #   3) pod summary
 #   4) pod detailed
-#
 #
 #
 #public:
@@ -26,9 +25,9 @@
 #   sub bcp_batch_error_handler {
 #
 #private:
-#   sub sx_grab_from_sybase {
-#   sub sx_grab_from_file {
-#   sub sx_grab_from_perl {
+#   sub _grab_from_sybase {
+#   sub _grab_from_file {
+#   sub _grab_from_perl {
 #   sub sx_cleanup {
 #
 #sendrow stuff
@@ -45,350 +44,395 @@
 #   sub sx_auto_delete_setup {
 #
 #option stuff
-#   sub sx_checkargs {
-#   sub sx_prep_xfer {
+#   sub _checkargs {
+#   sub _prep_xfer {
 #   sub sx_verify_options { 
 #   sub sx_from_file_map {
 #
 #error handling routinues
 #   sub sx_sendrow_failure {
 #   sub sx_sendrow_batch_failure {
-#   sub sx_print_error_detection {
+#   sub _print_error_detection {
 #   sub sx_error_tidy_msg {
 #   sub sx_oversize_error {
 #
 #util stuff
+#   sub _open_bcp {
+#
 #   sub sx_complain {
 #   sub sx_usage {
 #   sub sx_message_handler {
 #   sub sx_error_handler {
-#   sub sx_print {
-#   sub sx_open_bcp {
+#   sub sx_error_handler_dbi {
+#   sub _print {
 #   sub sx_debug {
 #   sub sx_delete_sql {
 #   sub sx_truncate_table {
 #   sub sx_delete_rows {
-#   sub sx_drop_indices {
-#   sub sx_create_indices {
+#   sub _drop_indices {
+#   sub _drop_indices_setup {
+#   sub _create_indices {
 #   sub sx_run_shell_cmd {
 #   sub sx_parse_user_hash {
-#   sub sx_parse_path {
+#   sub _parse_path {
 #
 #
 
-package Sybase::Xfer;
- 
-   use 5.005;
+    package Sybase::Xfer;
+
+    use 5.6.1;
 
 #set-up package
-   use strict;
-   use Exporter;
-   use Carp;
-   use vars qw/@ISA @EXPORT @EXPORT_OK %EXPORT_TAGS $VERSION/;
-   $VERSION = '0.51';
-   @ISA = qw/Exporter/;
+    use strict;
 
- 
-#RCS/CVS Version
-   my($RCSVERSION) = do {
-     my @r = (q$Revision: 1.42 $ =~ /\d+/g); sprintf "%d."."%02d" x $#r, @r
-   };
+#    use Exporter;
+#    use Carp;
+#    use vars qw/@ISA @EXPORT @EXPORT_OK %EXPORT_TAGS $VERSION/;
+#    @ISA = qw/Exporter/;
 
- 
-   
-#modules
-   use FileHandle;
-   use File::Basename;
-   use Sybase::DBlib;
-   use Sybase::ObjectInfo;
-   use Getopt::Long;
-   use Tie::IxHash;
+    use vars qw/$VERSION/;
+    $VERSION = '0.63';
 
+#RCS version
+    my ($RCSVERSION) = do {
+        my @r = ( q$Revision: 1.42 $ =~ /\d+/g );
+        sprintf "%d." . "%02d" x $#r, @r;
+    };
 
+#modules 
+#    use lib '/ms/dist/perl5/PROJ/DBI/1.30-5.6/lib/perl5/';
+#    use DBI;
+
+#Sybase DBD
+#     use lib '/ms/dist/perl5/PROJ/DBD-Sybase/0.94-5.6/lib/perl5/';
+#    use lib '/ms/dev/perl5/DBD-Sybase/0.95-5.6/install/.exec/sun4u.sunos64.5.8/lib/perl5';
+#     use lib '/ms/dist/perl5/PROJ/DBD-Sybase/0.95-5.6/lib/perl5/';
+
+#DB2
+#    use lib '/ms/dist/perl5/PROJ/DBD-DB2/0.76-5.6/lib/perl5/';
+#    use DBD::DB2;
+#    use DBD::DB2::Constants;
+
+#BLK routines for Sybase
+    use lib '/ms/dist/perl5/PROJ/syb/2.15-5.6/lib/perl5';
+
+#    use lib '/ms/dist/perl5/PROJ/syb/2.14-5.6/lib/perl5';
+    use Sybase::CTlib;
+
+#other stuff
+    use FileHandle;
+    use File::Basename;
+
+#    use Sybase::ObjectInfo;
+    use Getopt::Long;
+    use Tie::IxHash;
+
+    use Sys::Hostname;
+
+#to validate numbers
+    use POSIX qw/strtod/;
 
 #constants
-   use constant RS_UNRECOV_ERROR => -1;
-   use constant RS_INTERRUPT => -2;
-   use constant RS_TIMEOUT => -3;
+    use constant RS_UNRECOV_ERROR => -1;
+    use constant RS_INTERRUPT     => -2;
+    use constant RS_TIMEOUT       => -3;
 
 #globals
-   use vars qw/$DB_ERROR %opt $DB_ERROR_ONELINE/;
+    use vars qw/$DB_ERROR %opt $DB_ERROR_ONELINE $DB_DEADLOCK $DB_IN_ERR_HANDLER/;
 
 #-----------------------------------------------------------------------
 #constructor
 #-----------------------------------------------------------------------
-   sub new {
+    sub new {
 
-     my $self  = shift;
-     my $class = ref($self) || $self;
+        my $self  = shift;
+        my $class = ref($self) || $self;
+
 
 #basic option checking, bail out of error
-     my %opt = sx_checkargs(@_); 
-     return undef if exists $opt{1};
+        my %opt = $self->_checkargs(@_);
+        return undef if exists $opt{1};
 
-     $self = { %opt };
-     bless $self, $class;
+        $self = {%opt};
+        bless $self, $class;
 
-#install new err/msg handlers. will restore when done.
-     my $cb = sub { return sx_message_handler($self, @_) };
-     $self->{current_msg_handler} = dbmsghandle($cb);   
+#use CTlib instead of DBI
+        $self->{CTLib} = 1;
 
-     $cb = sub { return sx_error_handler($self, @_) };
-     $self->{current_err_handler} = dberrhandle($cb);
-
-#another option
-     $DB_ERROR = ();
-     $Sybase::DBlib::nsql_strip_whitespace++ if $self->{trim_whitespace};
+#other initializations
+        $DB_ERROR = ();
+        $Sybase::CTlib::nsql_strip_whitespace++ if $self->{trim_whitespace};
 
 #set the stage. delete/truncate; define source. if error return. 
-     sx_prep_xfer($self) && return undef; 
+        $self->_prep_xfer() && return undef;
 
 #squirrel away a few counts
-     $self->{sx_send_count} = 0;
-     $self->{sx_succeed_count} = 0;
-     $self->{sx_err_count} = 0;
-     $self->{sx_resend_count} = 0;
-     $self->{sx_send_count_batch} = 0;
-     $self->{sx_succeed_count_batch} = 0;
-     $self->{sx_err_count_batch} = 0;
-     $self->{sx_resend_count_batch} = 0;
-      
+        $self->{sx_send_count}          = 0;
+        $self->{sx_succeed_count}       = 0;
+        $self->{sx_err_count}           = 0;
+        $self->{sx_resend_count}        = 0;
+        $self->{sx_send_count_batch}    = 0;
+        $self->{sx_succeed_count_batch} = 0;
+        $self->{sx_err_count_batch}     = 0;
+        $self->{sx_resend_count_batch}  = 0;
 
-#interrupt signal
-     $SIG{INT} = sub { return sx_interrupt_handler($self) };
+#install interrupt signal handler
+        $SIG{INT} = sub { return sx_interrupt_handler($self) };
+
 
 #send it back
-     return $self;
-   }
+        return $self;
+    }
 
-
-     
 #---------
 #interrupt handler
 #----------
-   sub sx_interrupt_handler {
-      my $self = shift;
+    sub sx_interrupt_handler {
+        my $self = shift;
 
 #dummy up error message for sx_cleanup
-      $DB_ERROR = "Interrupt detected. Terminating transfer!";
+        $DB_ERROR = "Interrupt detected. Terminating transfer!";
 
 #print
-      sx_print($self, "\n");
-      sx_print($self, "------\n");
-      sx_print($self, "$DB_ERROR\n");
-      sx_print($self, "------\n");
+        $self->_print("\n");
+        $self->_print("------\n");
+        $self->_print("$DB_ERROR\n");
+        $self->_print("------\n");
 
-      $self->{GOT_INTERRUPT} = RS_INTERRUPT;
-      die 'interrupt';
+        $self->{GOT_INTERRUPT} = RS_INTERRUPT;
+        die 'interrupt';
 
-   }
-
+    }
 
 #----------
 #timeout handler
 #----------
-   sub sx_timeout_handler {
-      my $self = shift;
+    sub sx_timeout_handler {
+        my $self = shift;
 
 #dummy up error message for sx_cleanup
-      $DB_ERROR = "Timeout detected ($self->{timeout} seconds). Terminating transfer!";
+        $DB_ERROR = "Timeout detected ($self->{timeout} seconds). Terminating transfer!";
 
 #print
-      sx_print($self, "------\n");
-      sx_print($self, "$DB_ERROR\n");
-      sx_print($self, "------\n");
+        $self->_print("------\n");
+        $self->_print("$DB_ERROR\n");
+        $self->_print("------\n");
 
-      $self->{GOT_TIMEOUT} = RS_TIMEOUT;
-      die 'timeout';
+        $self->{GOT_TIMEOUT} = RS_TIMEOUT;
+        die 'timeout';
 
-   }
-
+    }
 
 #-----------------------------------------------------------------------
 #destroy the object
 #-----------------------------------------------------------------------
-   sub done {
-      my $self = shift;
-      my $class = ref($self) || $self;
+    sub done {
+        my $self  = shift;
+        my $class = ref($self) || $self;
 
 #return current handlers
-      dbmsghandle( $self->{current_msg_handler} );
-      dberrhandle( $self->{current_err_handler} );
+        ct_callback( CS_SERVERMSG_CB, $self->{current_err_handler} );
+        ct_callback( CS_CLIENTMSG_CB, $self->{current_msg_handler} );
 
-      my $num_success = $self->{sx_succeed_count};
-      my $num_err =   $self->{sx_err_count};
-      my $num_resend = $self->{sx_resend_count};
-      my $num_fails = $num_err - $num_resend;
+        my $num_success = $self->{sx_succeed_count};
+        my $num_err     = $self->{sx_err_count};
+        my $num_resend  = $self->{sx_resend_count};
+        my $num_fails   = $num_err - $num_resend;
 
-      $self = undef;
+        $self = undef;
 
-      return wantarray ? ($num_success, $num_err, $num_resend, $num_fails) : $num_success;
-   }
-
-
+        return wantarray ? ( $num_success, $num_err, $num_resend, $num_fails ) : $num_success;
+    }
 
 #-----------------------------------------------------------------------
 #xfer the data
 #-----------------------------------------------------------------------
-   sub xfer {
+    sub xfer {
 
-     my $self = shift;
-     my $class = ref($self) || $self;
+        my $self  = shift;
+        my $class = ref($self) || $self;
 
-     my $return = $_[0];
-     my %rstyle;
-     if(ref $return) {
-         %rstyle = %$return;
-     } elsif( $return ) {
-         %rstyle = @_;
-     } else {
-         %rstyle = (-return => 'ARRAY');
-     }
-     my $val = $rstyle{"-return"} || $rstyle{return};
-     sx_complain("unknown return key passed to xfer: <$return>\n"), return 1 unless $val;
-     unless(ref $val eq "HASH" || uc $val eq "HASH" || ref $val eq "ARRAY" || uc $val eq "ARRAY") {
-         sx_complain("-return must be HASH, ARRAY, {} or []\n") && return 1;
-     }
-     $self->{return} ||= $val;
+#set return type
+        my $return = $_[0];
+        my %rstyle;
+        if ( ref $return ) {
+            %rstyle = %$return;
+        }
+        elsif ($return) {
+            %rstyle = @_;
+        }
+        else {
+            %rstyle = ( -return => 'ARRAY' );
+        }
+        my $val = $rstyle{"-return"} || $rstyle{return};
+        sx_complain("unknown return key passed to xfer: <$return>\n"), return 1 unless $val;
+        unless ( ref $val eq "HASH" || uc $val eq "HASH" || ref $val eq "ARRAY" || uc $val eq "ARRAY" ) {
+            sx_complain("-return must be HASH, ARRAY, {} or []\n") && return 1;
+        }
+        $self->{return} ||= $val;
+
+
+
 
 #no buffering on stdout
-     $|++;
+        $|++;
 
 #timeout signal
-     if($self->{timeout}) {
-         alarm $self->{timeout};
-         $SIG{ALRM} = sub { return sx_timeout_handler($self) };
-     }
+        if ( $self->{timeout} ) {
+            alarm $self->{timeout};
+            $SIG{ALRM} = sub { return sx_timeout_handler($self) };
+        }
 
-     my $rs = 0;
 
-#pick the source
-     eval {
-         if(ref($self->{sx_sql_source}) eq "CODE") {
-            $rs = sx_grab_from_perl($self);
 
-         } elsif( ref($self->{sx_sql_source}) eq "FileHandle") {
-            $rs = sx_grab_from_file($self);
+#grab data from one of three possible genre of sources
+        my $rs = 0;
+        eval {
+            SWITCH: {
 
-         } else {
-            $rs = sx_grab_from_sybase($self);
+#perl code source
+                if ( ref( $self->{sx_xfer_source} ) =~ /^(CODE|ARRAY)/ ) {
+                    $rs = $self->_grab_from_perl();
+                    last;
+                }
 
-         }
-     };
-     if($@) {
-         $rs = $self->{GOT_INTERRUPT} || $self->{GOT_TIMEOUT};
-     }
+#file-like source
+                if ( UNIVERSAL::isa( $self->{sx_xfer_source}, 'IO::File' ) ) {
+                    $rs = $self->_grab_from_file();
+                    last;
+                }
+
+#db source
+                $rs = $self->_grab_from_db();
+                last;
+            }
+
+        };
+
+#check return
+        if ($@) {
+            $self->_print("main eval error: $@\n");
+            $rs = $self->{GOT_INTERRUPT} || $self->{GOT_TIMEOUT};
+        }
 
 #summarize, restore env 
-     my @rc = sx_cleanup($self, $rs);
+        my @rc = sx_cleanup( $self, $rs );
 
 #return with proper context
-     my $rstyle = $self->{return};
+        my $rstyle = $self->{return};
 
 #hash return
-     my %rs = ( rows_read =>$rc[1],
-                rows_transferred =>$rc[2],
-                last_error_msg =>$rc[3],
-                scalar_return => $rc[0],
-                ok => $rc[0] >= 0 ? 1 : 0,  #1=>all rows transferred, 0=>problems
-              );
+        my %rs = ( rows_read => $rc[1],
+            rows_transferred => $rc[2],
+            last_error_msg   => $rc[3],
+            scalar_return    => $rc[0],
+            ok               => $rc[0] >= 0 ? 1 : 0,    #1=>all rows transferred, 0=>problems
+        );
+
 #array return
-     my @rs = @rc[1..3,0];
-     $rs[4] = $rc[0] >= 0 ? 1 : 0;
+        my @rs = @rc[ 1 .. 3, 0 ];
+        $rs[4] = $rc[0] >= 0 ? 1 : 0;
 
 #scalar return
-     $rs = $rc[0];
-
+        $rs = $rc[0];
 
 #send it back
-     if($rstyle eq "HASH" || ref $rstyle eq "HASH" ) {
-         return wantarray ? %rs : $rs;
+        if ( $rstyle eq "HASH" || ref $rstyle eq "HASH" ) {
+            return wantarray ? %rs : $rs;
 
-     } elsif( $rstyle eq "ARRAY" || ref $rstyle eq "ARRAY") {
-         return wantarray ? @rs : $rs;
+        }
+        elsif ( $rstyle eq "ARRAY" || ref $rstyle eq "ARRAY" ) {
+            return wantarray ? @rs : $rs;
 
 #backward compatibility requires array if not specified
-     } else {
-         return wantarray ? @rs : $rs;
+        }
+        else {
+            return wantarray ? @rs : $rs;
 
-     } 
-   }
-
-
+        }
+    }
 
 
 #-----------------------------------------------------------------------
 #cleanup & exit
 #-----------------------------------------------------------------------
-  sub sx_cleanup {
+    sub sx_cleanup {
 
-     my ($self, $grab_rs) = @_;
+        my ( $self, $grab_rs ) = @_;
 
+#resave db error if not saved already
+        $self->{sx_save_db_error} = $DB_ERROR if $DB_ERROR && !$self->{sx_save_db_error};
+        $self->{sx_save_db_error_oneline} = $DB_ERROR_ONELINE if $DB_ERROR_ONELINE && !$self->{sx_save_db_error_oneline};
 
 #close 'from' and 'to' connections
-     $self->{sx_dbh_from}->dbclose() if $self->{sx_dbh_from};
-     $self->{sx_dbh_to_bcp}->dbclose() if $self->{sx_dbh_to_bcp};
+        $self->{sx_dbh_from} = undef if ref $self->{sx_dbh_from};
 
-#if indices we're dropped on 'to' table then recreate them now.
-     $self->{drop_and_recreate_indices} && sx_create_indices($self) && return 1;
+#        $self->{sx_dbh_to_bcp}->blk_drop() if ref $self->{sx_dbh_to_bcp};
+        $self->{sx_dbh_to_bcp} = undef if ref $self->{sx_dbh_to_bcp};
+
+#if indices were dropped on 'to' table then recreate them now.
+        $self->{drop_and_recreate_indices} && $self->_create_indices() && return 1;
 
 #close the non-bcp 'to' connection
-     $self->{sx_dbh_to_non_bcp}->dbclose() if $self->{sx_dbh_to_non_bcp};
-
+        $self->{sx_dbh_to_non_bcp} = undef if $self->{sx_dbh_to_non_bcp};
 
 #if number of rows sent is zero and an error condition, then sx_sendrow_bcp NEVER
 #called to field an error. So we have to do it here.
-      if($grab_rs) {
-         if($self->{sx_send_count} == 0 || $self->{GOT_INTERRUPT} || $self->{GOT_TIMEOUT}) { 
-            sx_print($self, "--------------\n");
-            sx_print($self, "Error detected. (non-recoverable)\n");
-            sx_error_tidy_msg($self);
-            sx_print($self, "--------------\n");
-         }
-        $self->{GOT_UNRECOV_ERROR} = 1;
-     }
-
-
+        if ($grab_rs) {
+            if ( $self->{sx_send_count} == 0 || $self->{GOT_INTERRUPT} || $self->{GOT_TIMEOUT} ) {
+                $self->_print("--------------\n");
+                $self->_print("Error detected. (non-recoverable)\n");
+                sx_error_tidy_msg($self);
+                $self->_print("--------------\n");
+            }
+            $self->{GOT_UNRECOV_ERROR} = 1;
+        }
 
 #return current handlers
-     dbmsghandle( $self->{current_msg_handler} );
-     dberrhandle( $self->{current_err_handler} );
+        ct_callback( CS_SERVERMSG_CB, $self->{current_err_handler} );
+        ct_callback( CS_CLIENTMSG_CB, $self->{current_msg_handler} );
 
 #restore nsql deadlock retry logic
-     $Sybase::DBlib::nsql_deadlock_retrycount= $self->{save_deadlock_retry};
-     $Sybase::DBlib::nsql_deadlock_retrysleep= $self->{save_deadlock_sleep};
-     $Sybase::DBlib::nsql_deadlock_verbose   = $self->{save_deadlock_verbose};
+        $Sybase::CTlib::nsql_deadlock_retrycount = $self->{save_deadlock_retry};
+        $Sybase::CTlib::nsql_deadlock_retrysleep = $self->{save_deadlock_sleep};
+        $Sybase::CTlib::nsql_deadlock_verbose    = $self->{save_deadlock_verbose};
 
 #restore alarm settings
-     alarm(0) if $opt{timeout};
+        alarm(0) if $opt{timeout};
 
 #last error saved if retry or continue
-     my $err_oneline = $self->{sx_save_db_error_oneline} || $DB_ERROR_ONELINE;
-     my $err = $self->{sx_save_db_error} || $DB_ERROR;
+        my $err_oneline = $self->{sx_save_db_error_oneline} || $DB_ERROR_ONELINE;
+        my $err = $self->{sx_save_db_error} || $DB_ERROR;
 
 #notification
-     my $num_fails = $self->{sx_err_count} - $self->{sx_resend_count};
-     unless( $self->{silent} ) {
-     
-       sx_print($self, "\n");
-       sx_print($self, "Xfer summary:\n");
-       sx_print($self, "   $self->{sx_send_count} rows read from source\n");
-       sx_print($self, "   $self->{sx_succeed_count} rows transferred to target\n");
-       sx_print($self, "   $self->{sx_err_count} rows had errors\n") if $self->{sx_err_count} > 0;
-       sx_print($self, "   $self->{sx_resend_count} total rows resent\n") if $self->{sx_resend_count} > 0;
-       sx_print($self, "   $num_fails total unsuccessful retries\n") if $num_fails >0 && $self->{error_handling} =~ /^retry/;
-       sx_print($self, "   last known error message encountered: $err_oneline\n") if $err_oneline;
-     }
+#     my $num_fails = $self->{sx_err_count} - $self->{sx_resend_count};
+        my $num_fails = $self->{sx_send_count} - $self->{sx_succeed_count};
+        unless ( $self->{silent} ) {
+
+            $self->_print("\n");
+            $self->_print("Xfer summary:\n");
+            $self->_print("   $self->{sx_send_count} rows read from source\n");
+            $self->_print("   $self->{sx_succeed_count} rows transferred to target\n");
+
+#8/29/01. too misleading when retry is on.
+##            $self->_print(  "   $self->{sx_err_count} rows had errors\n" ) if $self->{sx_err_count} > 0;
+##            $self->_print(  "   $self->{sx_resend_count} total rows resent\n" ) if $self->{sx_resend_count} > 0;
+
+#only if retry on
+            if ( $num_fails > 0 && $self->{error_handling} =~ /^retry/ ) {
+                $self->_print("   $num_fails total unsuccessful retries\n");
+            }
+
+            $self->_print("   last known error message encountered: $err_oneline\n") if $err_oneline;
+        }
 
 #get rid of empty error file
-     my $elf = $self->{sx_error_data_file_fh};
-     my $fn = $self->{error_data_file};
-     if ($elf) {
-       $elf->close(); 
-       unlink $fn unless $fn && -s $fn;
-     }
-
-
+        my $elf = $self->{sx_error_data_file_fh};
+        my $fn  = $self->{error_data_file};
+        if ($elf) {
+            $elf->close();
+            unlink $fn unless $fn && -s $fn;
+        }
 
 #set return values
 
@@ -399,161 +443,273 @@ package Sybase::Xfer;
 #   -2 = got interrupt
 #   -3 = got timeout
 #
-     my $scalar_return = 0;
-     $scalar_return ||= -2*$self->{GOT_INTERRUPT} || -3*$self->{GOT_TIMEOUT} || -1*$self->{GOT_UNRECOV_ERROR};
-     $scalar_return ||=  $num_fails;
-     my $num_rows_read = $self->{sx_send_count};
-     my $num_rows_xferred = $self->{sx_succeed_count};
-     return ( $scalar_return, $num_rows_read, $num_rows_xferred, $err);
+        my $scalar_return = 0;
+        $scalar_return ||= $self->{GOT_INTERRUPT} || $self->{GOT_TIMEOUT} || -1 * defined( $self->{GOT_UNRECOV_ERROR} );
+        if ( $num_fails >= 1 ) {
+            $scalar_return = -1.0 * abs($num_fails);
+        }
 
-   }
+        my $num_rows_read    = $self->{sx_send_count};
+        my $num_rows_xferred = $self->{sx_succeed_count};
 
+#        print "scalar return=$scalar_return, num_fails=$num_fails\n";    #DEBUG
+        return ( $scalar_return, $num_rows_read, $num_rows_xferred, $err );
 
+    }
 
 #-----------------------------------------------------------------------
-#grab data from sybase to push to 'to' server
+#routine to manage fetching one record at time from the 'from' source
 #-----------------------------------------------------------------------
-  sub sx_grab_from_sybase {
+    sub sx_get_row_at_a_time {
 
-    my $opt = shift;
+        my ( $self, $sql, $cb ) = @_;
+
+        if ( $self->{from_source} =~ /^dbd/i ) {
+
+            my $dbh = $self->{sx_dbh_from};
+
+#            my $sth = $dbh->do($sql);
+
+#send sql
+            my $sth;
+            unless ( $sth = $dbh->prepare($sql) ) {
+                $DB_ERROR = $dbh->errstr;
+                $self->_print( "error in dbi.prepare: " . $DB_ERROR . "\n" );
+                return 1;
+            }
+
+#run sql
+            my $re;
+            unless ( $re = $sth->execute ) {
+                $DB_ERROR = $sth->errstr;
+                $self->_print( "error in dbi.execute: <" . $DB_ERROR . ">\n" );
+                return 1;
+            }
+
+#field 'rows' one at a time
+            {
+                my ( @results, $set );
+                local $SIG{__WARN__} = sub { warn "SJS: $_[0]" if $_[0] !~ /no statement executing/; };
+                do {
+                    $cb->( $sth->fetchall_array( [] ) );
+                } while ( $sth->{syb_more_results} );
+            }
+            return 0;
+        }
+    }
+
+#-----------------------------------------------------------------------
+#grab data from dbi source to push to 'to' server
+#-----------------------------------------------------------------------
+    sub _grab_from_db {
+
+        my $self = shift;
 
 #remove the rows from target table
-    $opt->{auto_delete} && sx_remove_target_rows($opt) && return 1;
-
+        $self->{auto_delete} && $self->sx_remove_target_rows() && return 1;
 
 #get bcp connection
-    my ($db, $tab) = @{ $opt }{qw/sx_to_database sx_to_table/};
-    my $nc = scalar @{ $opt->{sx_to_info}->{ $db }->{ $tab }->{__COLNAMES__} };
-    $opt->{sx_dbh_to_bcp} = sx_open_bcp($opt->{to_table}, $opt, $nc);
-    return 1 if $opt->{sx_dbh_to_bcp} == 1;
+        my ( $db, $tab ) = @{$self}{qw/sx_to_database sx_to_table/};
+        my $nc = scalar @{ $self->{sx_to_info}->{$db}->{$tab}->{__COLNAMES__} };
+        $self->{sx_dbh_to_bcp} = $self->_open_bcp( $self->{to_table}, $nc );
+        return 1 if $self->{sx_dbh_to_bcp} == 1;
 
 #see if -from_file_map is specified. This could result in the re-ordering of fields
-     sx_from_file_map($opt) && return 1;
+        $self->sx_from_file_map() && return 1;
 
 #define cb for use with nsql
-    my $cb = sub { return sx_sendrow_bcp(\@_, $opt) }; 
+        my $cb = sub { return sx_sendrow_bcp( \@_, $self ) };
 
 #run nsql on 'from' server
-    sx_print($opt, "transferring rows to $opt->{to_server} : $opt->{to_table}\n") if($opt->{echo});
-    my $sql = $opt->{sx_sql_source};
-
+        $self->_print("transferring rows to $self->{to_server} : $self->{to_table}\n") if ( $self->{echo} );
+        my $sql = $self->{sx_xfer_source};
 
 #progress log
-    if ($opt->{progress_log} ) {
-       sx_print($opt, "\n");
-       sx_print($opt, "Progress log\n");
-    }
+        if ( $self->{progress_log} ) {
+            $self->_print("\n");
+            $self->_print("Progress log\n");
+        }
+
+#hack. peppler needs to fix...
+        local $SIG{__WARN__} = sub { warn "$_[0]" if $_[0] !~ /no statement executing/; };
 
 #$sql will be an arrayref when there are multiple batches in the from_sql/from_script
-    if( ref($sql) eq "ARRAY" ) {
-       for my $each_sql ( @{ $sql } ) {
-          sx_print($opt,"SQL:\n$each_sql\n") if $opt->{echo};
-          $opt->{sx_dbh_from}->nsql($each_sql, [], $cb);
-          last if $DB_ERROR
-       }
-    } else {
-       sx_print($opt,"SQL:\n$sql\n") if $opt->{echo};
-       $opt->{sx_dbh_from}->nsql($sql, [], $cb);
-    }
+        if ( ref($sql) eq "ARRAY" ) {
+            for my $each_sql ( @{$sql} ) {
+                $self->_print("SQL:\n$each_sql\n") if $self->{echo};
+                $self->_runsql( $self->{sx_dbh_from}, $each_sql, [], $cb );
+
+#!                $self->{sx_dbh_from}->func( $each_sql, [], $cb, 'nsql' );
+                last if $DB_ERROR;
+            }
+        }
+        else {
+            $self->_print("SQL:\n$sql\n") if $self->{echo};
+            $self->_runsql( $self->{sx_dbh_from}, $sql, [], $cb );
+
+#!            $self->{sx_dbh_from}->func( $sql, [], $cb, 'nsql' );
+        }
 
 #commit last set of rows
-    return !$DB_ERROR ? sx_sendrow_final_batch($opt) : 1;
-  }
-
+        return !$DB_ERROR ? $self->sx_sendrow_final_batch() : 1;
+    }
 
 #-----------------------------------------------------------------------
 #grab data from file and push to 'to' server
 #-----------------------------------------------------------------------
-  sub sx_grab_from_file {
+    sub _grab_from_file {
 
-     my $self = shift;
+        my $self = shift;
 
 #remove the rows from target table, if called for.
-     $self->{auto_delete} && sx_remove_target_rows($self) && return 1;
+        $self->{auto_delete} && sx_remove_target_rows($self) && return 1;
 
 #bcp init
-     my ($db, $tab) = @{ $self }{qw/sx_to_database sx_to_table/};
-     my $nc = scalar @{ $self->{sx_to_info}->{ $db }->{ $tab }->{__COLNAMES__} };
-     $self->{sx_dbh_to_bcp} = sx_open_bcp($self->{to_table}, $self, $nc);
-     return 1 if $self->{sx_dbh_to_bcp} == 1;
+        my ( $db, $tab ) = @{$self}{qw/sx_to_database sx_to_table/};
+        my $nc = scalar @{ $self->{sx_to_info}->{$db}->{$tab}->{__COLNAMES__} };
+        $self->{sx_dbh_to_bcp} = $self->_open_bcp( $self->{to_table}, $nc );
+        return 1 if $self->{sx_dbh_to_bcp} == 1;
 
 #see if -from_file_map is specified. This could result in the re-ordering of fields
-     sx_from_file_map($self) && return 1;
-     my ($map, %map) = ();
-     if ($self->{sx_from_file_map}) {
-         %map = %{ $self->{sx_from_file_map} };
-         $map++;
-     }
+        sx_from_file_map($self) && return 1;
+        my ( $map, %map ) = ();
+        if ( $self->{sx_from_file_map} ) {
+            %map = %{ $self->{sx_from_file_map} };
+            $map++;
+        }
 
 #log
-     if($self->{progress_log}) {
-        sx_print($self, "\n");
-        sx_print($self, "Progress log\n");
-     }
+        if ( $self->{progress_log} ) {
+            $self->_print("\n");
+            $self->_print("Progress log\n");
+        }
 
 #transfer the data by reading the file
-     my $delim = $self->{from_file_delimiter};
-     my $fh = $self->{sx_sql_source};
-     my @colnames = @{ $self->{sx_to_colnames} };
-     my ($status, $line) = (1, 0);
-     while( defined($line = <$fh>) && $status ) {
-        chomp $line; 
-        my $r_data = ();
-        if( $map ) {
-           $r_data = [ (split /$delim/, $line, -1) ]; #[ @map{@colnames} ] ];
-        } else {
-           $r_data = [ split /$delim/, $line, -1 ];
+        my $delim    = $self->{from_file_delimiter};
+        my $fixed    = $self->{from_file_pack_format};
+        my $fh       = $self->{sx_xfer_source};
+        my @colnames = @{ $self->{sx_to_colnames} };
+        my ( $status, $line ) = ( 1, 0 );
+        while ( defined( $line = <$fh> ) && $status ) {
+            chomp $line;
+            my $r_data = ();
+
+            if ( $delim && $map ) {
+                $r_data = [ ( split /$delim/, $line, -1 ) ];    #[ @map{@colnames} ] ];
+            }
+            elsif ( $delim && !$map ) {
+                $r_data = [ split /$delim/, $line, -1 ];
+            }
+            elsif ( $fixed && $map ) {
+                $r_data = [ ( unpack( $self->{from_file_pack_format}, $line ) ) ];
+            }
+            elsif ( $fixed && !$map ) {
+                $r_data = [ unpack( $self->{from_file_pack_format}, $line ) ];
+            }
+
+            $status = sx_sendrow_bcp( $r_data, $self )    #returns 1==good, 0==bad;
         }
-        $status = sx_sendrow_bcp($r_data, $self) #returns 1==good, 0==bad;
-     }
 
 #return
-     return $status ? sx_sendrow_final_batch($self) : 1;
+        return $status ? sx_sendrow_final_batch($self) : 1;
 
-  }
-
+    }
 
 #-----------------------------------------------------------------------
 #grab data from perl source
 #-----------------------------------------------------------------------
-  sub sx_grab_from_perl {
+    sub _grab_from_perl {
 
-     my $opt = shift;
+        my $opt = shift;
 
 #remove the rows from target table, if called for.
-     $opt->{auto_delete} && sx_remove_target_rows($opt) && return 1;
+        $opt->{auto_delete} && sx_remove_target_rows($opt) && return 1;
 
 #bcp init
-     my ($db, $tab) = @{ $opt }{qw/sx_to_database sx_to_table/};
-     my $nc = scalar @{ $opt->{sx_to_info}->{ $db }->{ $tab }->{__COLNAMES__} };
-     $opt->{sx_dbh_to_bcp} = sx_open_bcp($opt->{to_table}, $opt, $nc);
-     return 1 if $opt->{sx_dbh_to_bcp} == 1;
+        my ( $db, $tab ) = @{$opt}{qw/sx_to_database sx_to_table/};
+        my $nc = scalar @{ $opt->{sx_to_info}->{$db}->{$tab}->{__COLNAMES__} };
+        $opt->{sx_dbh_to_bcp} = $opt->_open_bcp( $opt->{to_table}, $nc );
+        return 1 if $opt->{sx_dbh_to_bcp} == 1;
 
 #progress log
-     if ($opt->{progress_log} ) {
-        sx_print($opt, "\n");
-        sx_print($opt, "Progress log\n");
-     }
+        if ( $opt->{progress_log} ) {
+            $opt->_print("\n");
+            $opt->_print("Progress log\n");
+        }
+
+        my $bcp_status = 1;
+
+#PERL - CODEREF
+        if ( ref $opt->{from_perl} eq 'CODE' ) {
 
 #transfer the data by calling perl code ref
-     my $bcp_status = 0;
-     my ($status_getrow, $r_data) =  $opt->{sx_sql_source}->(); 
-     while( $status_getrow ) {
-        $bcp_status = sx_sendrow_bcp($r_data, $opt);
-        last unless $bcp_status;
-        ($status_getrow, $r_data) = $opt->{sx_sql_source}->(); 
-     }
-     
+#return status of user function:
+#   < 0 => skip
+#  == 0 => quit
+#   > 0 => keep going
+            my ( $status_getrow, $r_data ) = $opt->{sx_xfer_source}->();
+            while ($status_getrow) {
+                if ( $status_getrow >= 1 ) {
+                    $bcp_status = sx_sendrow_bcp( $r_data, $opt );
+                }
+                else {
+                    $bcp_status = 1;
+                }
+                last unless $bcp_status;
+                ( $status_getrow, $r_data ) = $opt->{sx_xfer_source}->();
+            }
+
+#PERL - ARRAYREF
+        }
+        elsif ( ref $opt->{from_perl} eq 'ARRAY' ) {
+            for my $row ( @{ $opt->{from_perl} } ) {
+                $bcp_status = sx_sendrow_bcp( $row, $opt );
+                last unless $bcp_status;
+            }
+
+        }
+
 #set return
-     return $bcp_status ? sx_sendrow_final_batch($opt) : 1;
+        return $bcp_status ? sx_sendrow_final_batch($opt) : 1;
 
-  }
+    }
 
+#----
+#
+#----
+    sub _runsql {
+
+        my ( $self, $dbh, $sql, $type, $cb ) = @_;
+
+#ctlib connection
+        if ( $self->{CTLib} ) {
+            my @res = ();
+            eval { @res = $dbh->nsql( $sql, $type, $cb ) };
+            print "** eval: [$@] **\n" if $@;
+            return \@res;
+
+#dbi connection
+        }
+        else {
+            if ($type) {
+                my @res = ();
+                eval { @res = $dbh->func( $sql, $type, $cb, 'nsql' ); };
+                print "** eval: [$@] **\n" if $@;
+                return \@res;
+            }
+            else {
+                my $sth = $dbh->prepare($sql);
+                $sth->execute;
+                while ( $sth->{syb_more_results} ) { $sth->fetch() }
+            }
+        }
+
+    }
 
 #-----------------------------------------------------------------------
 #print opts
 #-----------------------------------------------------------------------
-  sub sx_debug {
+    sub sx_debug {
 
 #db handles
 #   $opt{sx_dbh_from}
@@ -561,7 +717,7 @@ package Sybase::Xfer;
 #   $opt{sx_dbh_to_bcp_temp}
 #   $opt{sx_dbh_to_non_bcp}
 #   
-#   $opt{sx_sql_source}
+#   $opt{sx_xfer_source}
 #
 #auto delete stuff
 #   $opt{sx_ad_create_table}
@@ -602,88 +758,107 @@ package Sybase::Xfer;
 #   $opt{sx_resend_count}
 #   $opt{sx_resend_count_batch}
 
-
-  }
-
-
+    }
 
 #-----------------------------------------------------------------------
 #auto delete
 #-----------------------------------------------------------------------
-  sub sx_remove_target_rows {
+    sub sx_remove_target_rows {
 
-    my $opt = shift;
+        my $opt = shift;
 
-    return 0 unless($opt->{auto_delete});
+        return 0 unless ( $opt->{auto_delete} );
 
-    if( $opt->{progress_log} ) {
-       sx_print($opt, "Auto delete log\n");
-    }
+        if ( $opt->{progress_log} ) {
+            $opt->_print("Auto delete log\n");
+        }
+
+# check target table to see if there's any rows in there
+        sx_check_target( $opt, "auto_delete" ) || return 0;
 
 #create temp table
-    $opt->{sx_dbh_to_non_bcp}->nsql($opt->{sx_ad_create_table},{});
-    $DB_ERROR && sx_complain("unable to create temp table\n$DB_ERROR\n") && return 1;
+        my ( $dbh_to, $dbh_from, $sql ) = @{$opt}{qw/sx_dbh_to_non_bcp sx_dbh_from sx_ad_create_table/};
+        $opt->_runsql( $dbh_to, $sql, {}, undef );
+
+#!        $opt->{sx_dbh_to_non_bcp}->func( $opt->{sx_ad_create_table}, {}, undef, 'nsql' );
+        $DB_ERROR && sx_complain("unable to create temp table\n$DB_ERROR\n") && return 1;
 
 #create a bcp connection to it
-    my $nc = scalar @{ $opt->{sx_ad_col_num} };
-    $opt->{sx_dbh_to_bcp_temp} = sx_open_bcp($opt->{sx_ad_temp_table}, $opt, $nc);
-    return 1 if $opt->{sx_dbh_to_bcp_temp} == 1;
+        my $nc = scalar @{ $opt->{sx_ad_col_num} };
+        $opt->{sx_dbh_to_bcp_temp} = $opt->_open_bcp( $opt->{sx_ad_temp_table}, $nc );
+        return 1 if $opt->{sx_dbh_to_bcp_temp} == 1;
 
 #callback for bcp
-    my $cb = sub { return sx_sendrow_temp(\@_, $opt) };
+        my %ad_seen = ();
+        my $cb      = sub { return sx_sendrow_temp( \@_, $opt, \%ad_seen ) };
 
 #do it. callback counts rows
-    sx_print($opt, "   bcping keys to $opt->{to_server} : $opt->{sx_ad_temp_table}\n") if $opt->{progress_log};
-    $opt->{sx_dbh_from}->nsql($opt->{sx_sql_source}, [], $cb);
-    $DB_ERROR && sx_complain("error in bcp'ing to temp table (a)\n$DB_ERROR\n") && return 1;
+        $sql = $opt->{sx_xfer_source};
+        $opt->_print("   bcping keys to $opt->{to_server} : $opt->{sx_ad_temp_table}\n") if $opt->{progress_log};
+        $opt->_runsql( $dbh_from, $sql, [], $cb );
+
+#!        $opt->{sx_dbh_from}->func( $opt->{sx_xfer_source}, [], $cb, 'nsql' );
+        $DB_ERROR && sx_complain("error in bcp'ing to temp table (a)\n$DB_ERROR\n") && return 1;
 
 #final batch
-    $opt->{sx_dbh_to_bcp_temp}->bcp_done();
-    $DB_ERROR && sx_complain("error in bcp'ing to temp table (b)\n$DB_ERROR\n") && return 1;
+        my $numRowsAffected;
+        $opt->{sx_dbh_to_bcp_temp}->blk_done( CS_BLK_ALL, $numRowsAffected );
+        $DB_ERROR && sx_complain("error in bcp'ing to temp table (b)\n$DB_ERROR\n") && return 1;
 
 #log message
-    if( $opt->{progress_log} ) {
-       sx_print($opt, "   $opt->{sx_ad_temp_tab_count} keys transferred\n");
-       sx_print($opt, "   creating index on temp table\n");
-    }
+        if ( $opt->{progress_log} ) {
+            $opt->_print("   $opt->{sx_ad_temp_tab_count} keys transferred\n");
+            $opt->_print("   creating index on temp table\n");
+        }
 
 #create index temp table
-    $opt->{sx_dbh_to_non_bcp}->nsql($opt->{sx_ad_create_index},{});
-    $DB_ERROR && sx_complain("unable to create temp table index\n$DB_ERROR\n") && return 1;
+        $sql = $opt->{sx_ad_create_index};
+        $opt->_runsql( $dbh_to, $sql, {}, undef );
 
+#!        $opt->{sx_dbh_to_non_bcp}->func( $opt->{sx_ad_create_index}, {}, undef, 'nsql' );
+        $DB_ERROR && sx_complain("unable to create temp table index\n$DB_ERROR\n") && return 1;
 
 #run the delete
-    if( $opt->{progress_log} ) {
-       sx_print($opt, "   auto_deleting rows in $opt->{to_server} : $opt->{to_table}\n");
-       sx_print($opt, "   $opt->{sx_ad_delete_join}\n") if $opt->{echo};
-    }
-    my @res = $opt->{sx_dbh_to_non_bcp}->nsql($opt->{sx_ad_delete_cmd}, {});
-    $DB_ERROR && sx_complain("error in deleting rows\n$DB_ERROR\n") && return 1;
+        if ( $opt->{progress_log} ) {
+            $opt->_print("   auto_deleting rows in $opt->{to_server} : $opt->{to_table}\n");
+            $opt->_print("   $opt->{sx_ad_delete_join}\n") if $opt->{echo};
+        }
+        $sql = $opt->{sx_ad_delete_cmd};
+        my @res = @{ $opt->_runsql( $dbh_to, $sql, {}, undef ) };
 
-    $opt->{sx_ad_rows_deleted} = $res[0]->{tot_rows};
-    my $loop = $res[0]->{loop};
-    if( $opt->{progress_log} ) {
-       sx_print($opt, "   $opt->{sx_ad_rows_deleted} rows deleted\n");    # if $opt->{echo} && $loop>1; 
-    }
+#!        my @res = $opt->{sx_dbh_to_non_bcp}->func( $opt->{sx_ad_delete_cmd}, {}, undef, 'nsql' );
+        $DB_ERROR && sx_complain("error in deleting rows\n$DB_ERROR\n") && return 1;
+
+        $opt->{sx_ad_rows_deleted} = $res[0]->{tot_rows};
+        my $loop = $res[0]->{loop};
+        if ( $opt->{progress_log} ) {
+            $opt->_print("   $opt->{sx_ad_rows_deleted} rows deleted\n");    # if $opt->{echo} && $loop>1;
+        }
 
 #destroy the temp table
-    @res = $opt->{sx_dbh_to_non_bcp}->nsql("drop table $opt->{sx_ad_temp_table}", []);
-    $DB_ERROR && sx_complain("error in dropping temp table\n$DB_ERROR\n") && return 1;
+        $sql = "drop table $opt->{sx_ad_temp_table}";
+        @res = @{ $opt->_runsql( $dbh_to, $sql, [], undef ) };
 
-    if( $opt->{progress_log} ) {
-       sx_print($opt, "   auto_delete successful\n\n");    # if $opt->{echo} && $loop>1; 
-    }
+#!        @res = $opt->{sx_dbh_to_non_bcp}->func("drop table $opt->{sx_ad_temp_table}", [], undef, 'nsql' );
+        $DB_ERROR && sx_complain("error in dropping temp table\n$DB_ERROR\n") && return 1;
+
+        if ( $opt->{progress_log} ) {
+            $opt->_print("   auto_delete successful\n\n");    # if $opt->{echo} && $loop>1;
+        }
+
+#        my $db  = $opt->{sx_to_database};
+#        my $tab = $opt->{sx_to_table};
+#        my $xxx = scalar @{ $opt->{sx_to_info}->{$db}->{$tab}->{__COLNAMES__} };
+#        print "3. db=$db, tab=$tab, xxx=$xxx\n";
 
 #success
-    return 0;
-  }
-
-
+        return 0;
+    }
 
 #----
 #parse a user hash
 #-----
-  sub sx_parse_user_hash {
+    sub sx_parse_user_hash {
 
 #this is a string like the following:
 #
@@ -692,103 +867,101 @@ package Sybase::Xfer;
 #  real perl hashref
 #  'filename' that contains hash
 #
-      my ($uh, $option) = (shift, shift);  
-      my %uhash = ();
-      my $err = '';
+        my ( $uh, $option ) = ( shift, shift );
+        my %uhash = ();
+        my $err   = '';
 
 #real perl hash reference
-      if(ref $uh eq 'HASH') {
-          %uhash = %$uh;
+        if ( ref $uh eq 'HASH' ) {
+            %uhash = %$uh;
 
 #char list
-      } elsif( $uh =~ /^\s*\(/ ) {
-          { 
-             no strict;
-             local $SIG{__WARN__} = sub { warn "$_[0]\n"};
-              %uhash = eval "$uh";
-          }
-          $err = $@;
+        }
+        elsif ( $uh =~ /^\s*\(/ ) {
+            {
+                no strict;
+                local $SIG{__WARN__} = sub { warn "$_[0]\n" };
+                %uhash = eval "$uh";
+            }
+            $err = $@;
 
 #maybe char ref
-      } elsif( $uh =~ /^\s*\{/ ) {
-           my $s = ();
-           {
-              no strict;
-              local $SIG{__WARN__} = sub {};
-              $s = eval "$uh";
-           }
-           unless($@) {
-               $err = $@;
-               %uhash = %$s;
-           }
- 
-#see if it's a file
-      } elsif( $uh =~ /[^\,\=]/ ) {
-            open(F,"<$uh") or $err = "couldn't open <$uh>: $!";
-            if(!$err) {
-               my @lines = <F>;
-               my $lines= join '', @lines;
-               $lines = '('.$lines if $lines !~ /^\s*\(/;
-               $lines .= ')' if $lines !~ /\)\s*$/;
-               {
-                 local $SIG{__WARN__} = sub {};
-                 %uhash = eval "$lines";
-               }
-               $err = $@;
-               close(F);
+        }
+        elsif ( $uh =~ /^\s*\{/ ) {
+            my $s = ();
+            {
+                no strict;
+                local $SIG{__WARN__} = sub { };
+                $s = eval "$uh";
             }
- 
+            $err = $@;
+            unless ($err) {
+                %uhash = %$s;
+            }
+
+#see if it's a file
+        }
+        elsif ( $uh =~ /[^\,\=]/ ) {
+            open( F, "<$uh" ) or $err = "couldn't open <$uh>: $!";
+            if ( !$err ) {
+                my @lines = <F>;
+                my $lines = join '', @lines;
+                $lines = '(' . $lines if $lines !~ /^\s*\(/;
+                $lines .= ')' if $lines !~ /\)\s*$/;
+                {
+                    local $SIG{__WARN__} = sub { };
+                    %uhash = eval "$lines";
+                }
+                $err = $@;
+                close(F);
+            }
+
 #something's wrong
-      } else {
+        }
+        else {
             $err = "can't parse $option";
- 
-      }
 
-      return (\%uhash, $err);
-   }
+        }
 
-
-
+        return ( \%uhash, $err );
+    }
 
 #---
 #
 #---
-  sub sx_from_file_map {
+    sub sx_from_file_map {
 
-      my $self = shift;
-      my $p = $self->{from_file_map};
+        my $self = shift;
+        my $p    = $self->{from_file_map};
 
-      my $db = $self->{sx_to_database};
-      my $tab = $self->{sx_to_table};
-      my @cols = @{ $self->{sx_to_colnames} };
+        my $db   = $self->{sx_to_database};
+        my $tab  = $self->{sx_to_table};
+        my @cols = @{ $self->{sx_to_colnames} };
 
-
-
-      my %map = ();
+        my %map = ();
 
 #check if user specified a map. can be hashref, char string of list, for file
-      if($p) {
+        if ($p) {
 
 #parse the value. verify options has already verified no parsing error
-         my ($m, $err) = sx_parse_user_hash($p, '-from_file_map');
-         %map = %$m;
-
+            my ( $m, $err ) = sx_parse_user_hash( $p, '-from_file_map' );
+            %map = %$m;
 
 #check for accuracy
-         my @nf  = grep { !exists $map{$_} } @cols;
-         if (@nf) { 
-            sx_complain("the following fields are in -to_table but are not mapped: @nf\n");
-            return 1;
-         }
+            my @nf = grep { !exists $map{$_} } @cols;
+            if (@nf) {
+                sx_complain("the following fields are in -to_table but are not mapped: @nf\n");
+                return 1;
+            }
 
 #make sure all the columns in -to_table are mapped
-         my %cols = ();
-         @cols{@cols} = ();
-         @nf  = grep { !exists $cols{$_}  } keys %map;
-         if (@nf) {
-            sx_complain("the following fields are in the map but not in -to_table: @nf\n");
-            return 1;
-         }
+            my %cols = ();
+            @cols{@cols} = ();
+            @nf = grep { !exists $cols{$_} } keys %map;
+            if (@nf) {
+                sx_complain("the following fields are in the map but not in -to_table: @nf\n");
+                return 1;
+            }
 
 #it's quite ok not to map certain fields in the -from_source
 #         @cols{values %map} = ();
@@ -798,43 +971,35 @@ package Sybase::Xfer;
 #            return 1;
 #         }
 
-          
-          $self->{sx_from_file_map} = \%map;
-          $self->{sx_from_file_map_indices} = [ @map{@cols} ];
+            $self->{sx_from_file_map}         = \%map;
+            $self->{sx_from_file_map_indices} = [ @map{@cols} ];
 
-     } else {
-          $self->{sx_from_file_map} = 0;
-          $self->{sx_from_file_map_indices} = 0;
-     }
+        }
+        else {
+            $self->{sx_from_file_map}         = 0;
+            $self->{sx_from_file_map_indices} = 0;
+        }
 
-       
-      return 0;
-  }
-
-
-
+        return 0;
+    }
 
 #-------
 #
 #-------
-  sub sx_sendrow_final_batch {
+    sub sx_sendrow_final_batch {
 
-     my $self = shift;
+        my $self = shift;
 
 #commit last set of rows
-     my $rc = 0;
-#     if($status) {
-         $rc = sx_sendrow_batch($self); #<0 == bad, >=0 == good
-         $rc = $rc < 0 ? 1 : 0;
-#     } else {
-#         $rc = ! $status;
-#     }
+        my $rc = 0;
+        if ( $self->{sx_send_count_batch} > 0 ) {
+            $rc = sx_sendrow_batch($self);    #<0 == bad, >=0 == good
+            $rc = $rc == &CS_FAIL ? 1 : 0;
+        }
 
 #1 == error, 0 == success
-     return $rc;
-  }
-
-
+        return $rc;
+    }
 
 #-----------------------------------------------------------------------
 #auto_delete callback
@@ -843,76 +1008,113 @@ package Sybase::Xfer;
     sub sx_sendrow_temp {
 
 #args
-      my $r_row = $_[0];
-      my $opt = $_[1];
-      
+        my ( $r_row, $opt, $ad_seen ) = @_;
 
 #pull out the key columns only
-      my @bcp_row = @{$r_row} [ @{ $opt->{sx_ad_col_num} } ];
+        my @bcp_row = @{$r_row}[ @{ $opt->{sx_ad_col_num} } ];
+
+#only do unique rows
+        my $distinct = join '', @bcp_row;
+        return 1 if $ad_seen->{$distinct};
+        $ad_seen->{$distinct} = 1;
 
 #row count
-      $opt->{sx_ad_temp_tab_count}++;
+        $opt->{sx_ad_temp_tab_count}++;
 
 #send the row
-      my $status_send = $opt->{sx_dbh_to_bcp_temp}->bcp_sendrow(@bcp_row); 
-      $DB_ERROR && sx_complain("$DB_ERROR\n") && return 0;
+        my $status_send = $opt->{sx_dbh_to_bcp_temp}->blk_rowxfer( \@bcp_row );
+        $DB_ERROR && sx_complain("$DB_ERROR\n") && return 0;
 
 #commit the row
-      if($opt->{sx_ad_temp_tab_count} % $opt->{batchsize} == 0) {
-         sx_print($opt, '   '.$opt->{sx_ad_temp_tab_count} . " keys transferred\n") if $opt->{echo};
-         $opt->{sx_dbh_to_bcp_temp}->bcp_batch();
-         $DB_ERROR && sx_complain("$DB_ERROR\n") && return 0;
-      }
+        if ( $opt->{sx_ad_temp_tab_count} % $opt->{batchsize} == 0 ) {
+            my $numRowsAffected;
+            $opt->_print( '   ' . $opt->{sx_ad_temp_tab_count} . " keys transferred\n" ) if $opt->{echo};
+            $opt->{sx_dbh_to_bcp_temp}->blk_done( CS_BLK_BATCH, $numRowsAffected );
+            $DB_ERROR && sx_complain("$DB_ERROR\n") && return 0;
+        }
 
-      return 1;
+        return 1;
     }
-
-
-
 
 #-----------------------------------------------------------------------
 #the actual callback - bcp version
 #must return 1 on success (nsql requirement)
 #-----------------------------------------------------------------------
-   sub sx_sendrow_bcp {
+    sub sx_sendrow_bcp {
 
 #args
-     my ($r_row, $opt) = @_;
+        my ( $r_row, $opt ) = @_;
 
-     my $dbh = $opt->{sx_dbh_to_bcp};
-     my ($status_cb_pre, $status_cb_err_send, $status_cb_err_batch) = ();
-     my ($status_send, $status_batch) = ();
+        my $dbh = $opt->{sx_dbh_to_bcp};
+        my ( $status_cb_pre, $status_cb_err_send, $status_cb_err_batch ) = ();
+        my ( $status_send, $status_batch ) = ();
 
-#the actual data
-     my @row = @$r_row; 
-		 
 
 #---
 #user-defined callback pre send
 #---
-     $status_cb_pre = 1;
-     if( ref( $opt->{callback_pre_send} ) eq 'CODE') {
-       my $r_user_row = ();
-       ($status_cb_pre, $r_user_row) = $opt->{callback_pre_send}->($r_row) ;
-       if($status_cb_pre) {
-          @row = @$r_user_row;
-       } else {
-          sx_complain("User-defined '-callback_pre_send' failed ($opt->{callback_pre_send}).\n");
-          return 0;
-       }
-     }
-             
+        $status_cb_pre = 1;
+        if ( ref( $opt->{callback_pre_send} ) eq 'CODE' ) {
+            my $r_user_row = ();
+            ( $status_cb_pre, $r_user_row ) = $opt->{callback_pre_send}->($r_row);
+
+#>0  => use @row returned by user
+            if ( $status_cb_pre > 0 ) {
+
+                $r_row = $r_user_row;
+            }
+
+#<0  => skip row altogether
+            elsif ( $status_cb_pre < 0 ) {
+                $opt->{sx_send_count}++;
+                $opt->{sx_send_count_batch}++;
+                return 1;
+
+#==0 => abort based on user
+            }
+            else {
+                sx_complain("User-defined '-callback_pre_send' failed ($opt->{callback_pre_send}).\n");
+                return 0;
+            }
+
+        }
+
 #debug
-     if($opt->{debug}) { 
-        my $i=0; for my $y (@row) { $i++; sx_print($opt,"$i:\t<$y>\n"); } 
-     }
+        if ( ( $opt->{debug} & 0x02 ) != 0 ) {
+            my $i = 0;
+            for my $y (@$r_row) { $i++; $opt->_print("$i:\t<$y>\n"); }
+        }
 
 #---
 #if -map is speficied, this will call for a possible re-ordering of fields
 #---
-    if($opt->{sx_from_file_map}) {
-        @row = @row[ @{ $opt->{sx_from_file_map_indices} } ];
-     }
+        if ( $opt->{sx_from_file_map} ) {
+            $r_row = [ @{$r_row}[ @{ $opt->{sx_from_file_map_indices} } ] ];
+        }
+
+#---
+#null out identity columns if server is going to set them
+#---
+       if (exists $opt->{identity_column}) {
+           $r_row->[ $opt->{identity_column} ] = undef;
+       }
+
+#---
+#image columns are returned as strings in perl. #eg '151c2001ff34ac'  is
+#obviously a string in hex - however when it comes back from perl via  a
+#select statement it comes back in the form of a *character  string*  of
+#hex digits. this code changes to its native chars.
+#---
+       for my $c ( @{ $opt->{binary_columns} } ) {
+
+#lose the 0x business
+         $r_row->[$c] = substr($r_row->[$c],2) if substr($r_row->[$c],0,2) eq '0x';
+
+#convert to char
+         $r_row->[$c] = pack("H*", $r_row->[$c]); 
+       }
+
+      
 
 
 
@@ -920,722 +1122,1129 @@ package Sybase::Xfer;
 #send row - will snag client errors
 #---
 #status_send will == 0 on errors as well as DB_ERROR being set.
-     $DB_ERROR = ();
-     $opt->{sx_send_count}++; 
-     $opt->{sx_send_count_batch}++;
-     $status_send = 1;
-     if ($dbh->bcp_sendrow(\@row) == FAIL )  {
-        $status_send = 0; 
-     }
-     $status_send = 0 if $DB_ERROR;
+        $DB_ERROR = ();
+        $opt->{sx_send_count}++;
+        $opt->{sx_send_count_batch}++;
+        $status_send = 1;
+
+#confirm number of columns in the source matches the target. ctlib v2.15 is presently core'ing on mismatch
+        my ($l1, $l2) =  (scalar @$r_row, $opt->{sx_to_numcols});
+
+#push undef to end of record data record less than target table.
+        if($l1 < $l2) {
+            push @$r_row, undef for 1 .. ($l2 - $l1);
+        }
+
+#signal error if data record greater than target table
+        if( $l1 > $l2 ) {
+            $DB_ERROR="number of columns in data record does not match number of columns in target table\n";
+            $DB_ERROR_ONELINE=$DB_ERROR;
+        }
+
+#make the call to send the data
+        if(!$DB_ERROR) { 
+           if ( $dbh->blk_rowxfer($r_row) == CS_FAIL ) {
+               $status_send = 0;
+            }
+        }
+        $status_send = 0 if $DB_ERROR;
 
 
 #save the row iff error_handling == 'retry'
-     if( $opt->{error_handling} =~ /^retry/i ) {
-         push @{ $opt->{data_rows} }, {rn=>$opt->{sx_send_count}, row=>[@row]} 
-     }
+        if ( $opt->{error_handling} =~ /^retry/i ) {
+            push @{ $opt->{data_rows} }, {
+                rn  => $opt->{sx_send_count},
+                row => $r_row,
+            };
+        }
 
 #check for failure on send
-     if( !$status_send ) {
-        $opt->{sx_err_count}++; 
-        $opt->{sx_err_count_batch}++;
-        $status_send = sx_sendrow_failure($opt, \@row);
-     } else {
-#        $opt->{sx_succeed_count}++; 
-        $opt->{sx_succeed_count_batch}++;
-     } 
+        if ( !$status_send ) {
+            $opt->{sx_err_count}++;
+            $opt->{sx_err_count_batch}++;
+            $status_send = sx_sendrow_failure( $opt, $r_row );
 
+        }
+        else {
+            $opt->{sx_succeed_count_batch}++;
+        }
 
 #commit
-      $status_batch = 1;
-      if($opt->{sx_send_count} % $opt->{batchsize} == 0) {
-         $status_batch = sx_sendrow_batch($opt);
-         $opt->{sx_send_count_batch} = 0; 
-         $opt->{sx_resend_count_batch} = 0;
-         $opt->{sx_succeed_count_batch} = 0; 
-         $opt->{sx_err_count_batch} = 0;
-      }
+        $status_batch = 1;
+        if ( $opt->{sx_send_count} % $opt->{batchsize} == 0 ) {
+            $status_batch = sx_sendrow_batch($opt);
+            $opt->{sx_send_count_batch}    = 0;
+            $opt->{sx_resend_count_batch}  = 0;
+            $opt->{sx_succeed_count_batch} = 0;
+            $opt->{sx_err_count_batch}     = 0;
+        }
 
 #set return code
-     
-     return sx_sendrow_return($opt, $status_send, $status_batch, $status_cb_pre);
+        return sx_sendrow_return( $opt, $status_send, $status_batch, $status_cb_pre );
 
-   }
-   
-
+    }
 
 #-----------------------------------------------------------------------
 #sendrow failure processing
 #-----------------------------------------------------------------------
-   sub sx_sendrow_failure {
+    sub sx_sendrow_failure {
 
-     my $opt = shift;
-     my $r_row = shift;
+        my $opt   = shift;
+        my $r_row = shift;
 
-     my $status_send = ();
-     my $pissant_warning = 0;
+        my $status_send     = ();
+        my $pissant_warning = 0;
 
 #squirrel the errors away
-      $opt->{sx_save_db_error} = $DB_ERROR;
-      $opt->{sx_save_db_error_oneline} = $DB_ERROR_ONELINE;
+        $opt->{sx_save_db_error}         = $DB_ERROR;
+        $opt->{sx_save_db_error_oneline} = $DB_ERROR_ONELINE;
 
 #a) err send is a cb
-     if( ref( $opt->{callback_err_send} ) eq 'CODE' && $opt->{error_handling} !~ /^abort/i) { 
-         my ($status_cb_err_send, $u_row) = 
-               $opt->{callback_err_send}->(DB_ERROR => $DB_ERROR, 
-                                           row_num  => $opt->{sx_send_count},
-                                           row_ptr  => $r_row);
+        if ( ref( $opt->{callback_err_send} ) eq 'CODE' && $opt->{error_handling} !~ /^abort/i ) {
+            my ( $status_cb_err_send, $u_row ) = $opt->{callback_err_send}->(
+              DB_ERROR => $DB_ERROR,
+              row_num  => $opt->{sx_send_count},
+              row_ptr  => $r_row
+            );
 
 #if user indicated retry status- then send the (fixed-up) row again!
-         if($status_cb_err_send) { 
-            $opt->{sx_resend_count}++; 
-            $opt->{sx_resend_count_batch}++;
-            my $rs = sx_sendrow_bcp($u_row, $opt);
-            $DB_ERROR = ();   #clean-up error
-            $status_send = 1; #force success
-         } else {
-            $status_send = 0;
-         }
+            if ($status_cb_err_send) {
+                $opt->{sx_resend_count}++;
+                $opt->{sx_resend_count_batch}++;
+                my $rs = sx_sendrow_bcp( $u_row, $opt );
+                $DB_ERROR    = ();    #clean-up error
+                $status_send = 1;     #force success
+            }
+            else {
+                $status_send = 0;
+            }
 
 #b) err send is a HASH
-     } elsif( ref( $opt->{callback_err_send} ) eq 'HASH' && $opt->{error_handling} !~ /^abort$/i) { 
-         ${ $opt->{callback_err_send} }{ $opt->{sx_send_count} }->{msg} = $DB_ERROR;
-         ${ $opt->{callback_err_send} }{ $opt->{sx_send_count} }->{row} = $r_row;                 
-         $DB_ERROR = ();
-         $status_send = 1;
+        }
+        elsif ( ref( $opt->{callback_err_send} ) eq 'HASH' && $opt->{error_handling} !~ /^abort$/i ) {
+            ${ $opt->{callback_err_send} }{ $opt->{sx_send_count} }->{msg} = $DB_ERROR;
+            ${ $opt->{callback_err_send} }{ $opt->{sx_send_count} }->{row} = $r_row;
+            $DB_ERROR    = ();
+            $status_send = 1;
 
 #c) no err cb - print offending row
-     } else {
+        }
+        else {
 
 #regardless of -error_handling write to edf if specified; otherwise stderr
-         if ($opt->{error_data_file}) {
-            my $rn = $opt->{sx_send_count};
-            my $elf = $opt->{sx_error_data_file_fh};
-            local($") = "|";
-            print $elf "#recnum=$rn, reason=$DB_ERROR_ONELINE\n@{$r_row}\n";
+            if ( $opt->{error_data_file} ) {
+                my $rn  = $opt->{sx_send_count};
+                my $elf = $opt->{sx_error_data_file_fh};
+                local ($") = "|";
+                print $elf "#recnum=$rn, reason=$DB_ERROR_ONELINE\n@{$r_row}\n";
 
 #print out the row smartly to stderr
-         } else {
-            $opt->{override_silent}++;
-            my $n = $opt->{sx_send_count};
-            sx_oversize_error($opt, $r_row, $n, $DB_ERROR); 
-            $pissant_warning++ if $DB_ERROR_ONELINE =~ /oversized row/;
-         }
+            }
+            else {
+                $opt->{override_silent}++;
+                my $n = $opt->{sx_send_count};
+                sx_oversize_error( $opt, $r_row, $n, $DB_ERROR );
+                $pissant_warning++ if $DB_ERROR_ONELINE =~ /oversized row/;
+            }
 
 #set return status
 #  continue => plow ahead and skip this row
 #  retry    => since callback defined, skip this row
 #  abort    => stop now
 
-         if($pissant_warning) {
-            $status_send = 1;
-         } else {
-            if ($opt->{error_handling} =~ /^abort/i ) {
-                $opt->{GOT_UNRECOV_ERROR} = 1;
-                 $status_send = 0;
-             } else {
-                 $status_send = 1;
-             }
-         }
+            if ($pissant_warning) {
+                $status_send = 1;
+            }
+            else {
+                if ( $opt->{error_handling} =~ /^abort/i ) {
+                    $opt->{GOT_UNRECOV_ERROR} = 1;
+                    $status_send = 0;
+                }
+                else {
+                    $status_send = 1;
+                }
+            }
 
-     }
+        }
 
-     return $status_send;
+        return $status_send;
 
-  }
-
+    }
 
 #-----------------------------------------------------------------------
 #print sybase error nicely
 #-----------------------------------------------------------------------
-  sub sx_error_tidy_msg {
-      my $self = shift;
+    sub sx_error_tidy_msg {
+        my $self = shift;
 
 #      if (substr($DB_ERROR, 0,-1) !~ /\n/s ) {
-         sx_print($self, "   error_message  : $DB_ERROR_ONELINE\n");
-#      } else {
-#         sx_print($self, "   error_message  : $DB_ERROR_ONELINE");
-#      }
-  }
+        $self->_print("   error_message  : $DB_ERROR_ONELINE\n");
 
+#      } else {
+#         $self->_print("   error_message  : $DB_ERROR_ONELINE");
+#      }
+    }
 
 #-----------------------------------------------------------------------
 #print error detection status
 #-----------------------------------------------------------------------
-  sub sx_print_error_detection {
-      my $opt = shift;
-      sx_print($opt, "--------------\n");
-      sx_print($opt, "Error detected\n");
-      sx_print($opt, "   error_handling : $opt->{error_handling}\n");
-      sx_print($opt, "   error_data_file: $opt->{error_data_file}\n") if $opt->{error_data_file};
-      sx_print($opt, "   rows read      : $opt->{sx_send_count}\n");
-      sx_error_tidy_msg($opt);
-      sx_print($opt, "   callback_err_send  = $opt->{callback_err_send}\n") if defined $opt->{callback_err_send};
-      sx_print($opt, "   callback_err_batch = $opt->{callback_err_batch}\n") if defined $opt->{callback_err_batch};
-      sx_print($opt, "--------------\n");
-  }
-
+    sub _print_error_detection {
+        my $self = shift;
+        $self->_print("--------------\n");
+        $self->_print("Error detected\n");
+        $self->_print("   error_handling : $self->{error_handling}\n");
+        $self->_print("   error_data_file: $self->{error_data_file}\n") if $self->{error_data_file};
+        $self->_print("   rows read      : $self->{sx_send_count}\n");
+        $self->sx_error_tidy_msg();
+        $self->_print("   callback_err_send  = $self->{callback_err_send}\n")  if defined $self->{callback_err_send};
+        $self->_print("   callback_err_batch = $self->{callback_err_batch}\n") if defined $self->{callback_err_batch};
+        $self->_print("--------------\n");
+    }
 
 #-----------------------------------------------------------------------
 #what to do on send batch failure
 #-----------------------------------------------------------------------
-  sub sx_sendrow_batch_failure {
+    sub sx_sendrow_batch_failure {
 
-      my $opt = shift;
+        my $opt = shift;
 
-      my $status_batch = ();
+        my $status_batch = ();
 
 #squirrel the errors away
-      $opt->{sx_save_db_error} = $DB_ERROR;
-      $opt->{sx_save_db_error_oneline} = $DB_ERROR_ONELINE;
-
+        $opt->{sx_save_db_error}         = $DB_ERROR;
+        $opt->{sx_save_db_error_oneline} = $DB_ERROR_ONELINE;
 
 #ABORT
-      if($opt->{error_handling} =~ /^abort$/i) {
-          sx_print_error_detection($opt);
-          $status_batch = 0; 
-          $opt->{GOT_UNRECOV_ERROR} = 1;
+        if ( $opt->{error_handling} =~ /^abort$/i ) {
+            $opt->_print_error_detection();
+            $status_batch = 0;
+            $opt->{GOT_UNRECOV_ERROR} = 1;
 
 #CONTINUE OR RETRY
-      } elsif($opt->{error_handling} =~ /^continue/i || $opt->{error_handling} =~ /^retry/i) {
+        }
+        elsif ( $opt->{error_handling} =~ /^continue/i || $opt->{error_handling} =~ /^retry/i ) {
 
-          
 #a) callback exists. returns status(1=resend batch, 0=abort batch) and a ref to the rows
-          my $cb = $opt->{callback_err_batch};
-          if( ref($cb) eq 'CODE' ) {
-              my ($cb_status, $ref_row) = $cb->(DB_ERROR  => $DB_ERROR, 
-                                                row_num   => $opt->{sx_send_count},
-                                                rows      => \@{ $opt->{data_rows} },
-                                                xfer_self => $opt);
+            my $cb = $opt->{callback_err_batch};
+            if ( ref($cb) eq 'CODE' ) {
+                my ( $cb_status, $ref_row ) = $cb->(
+                  DB_ERROR  => $DB_ERROR,
+                  row_num   => $opt->{sx_send_count},
+                  rows      => \@{ $opt->{data_rows} },
+                  xfer_self => $opt
+                );
 
-              if($cb_status == 0) {
-                 $status_batch = 0;
-              } elsif($cb_status > 0) {
-                 $status_batch = sx_sendrow_batch_of_size($opt, $ref_row, $cb_status);
-              }
-              $DB_ERROR = ();
-      
+                if ( $cb_status == 0 ) {
+                    $status_batch = 0;
+                }
+                elsif ( $cb_status > 0 ) {
+                    $status_batch = sx_sendrow_batch_of_size( $opt, $ref_row, $cb_status );
+                }
+                else {
+                }
+                $DB_ERROR = ();
 
 #b) no callback
-          } else {
-              $status_batch = 0;
-              sx_print_error_detection($opt);
+            }
+            else {
+                $status_batch = 0;
+                $opt->_print_error_detection();
+
 #@             sx_error_tidy_msg($opt);
-#@              $DB_ERROR && sx_print($opt, "$DB_ERROR\n");
-               sx_print($opt, "bcp_batch error, -error_handling=$opt->{error_handling}, but no " .
-                        "-callback_err_batch defined\n");
-          }
-      } 
+#@              $DB_ERROR && $opt->_print( "$DB_ERROR\n");
+                $opt->_print(
+                    "blk_done error, -error_handling=$opt->{error_handling}, but no " . "-callback_err_batch defined\n" );
+            }
+        }
 
-       return $status_batch;      
-   }
-
-
+        return $status_batch;
+    }
 
 #-----------------------------------------------------------------------
 #commit the rows
 #-----------------------------------------------------------------------
-  sub sx_sendrow_batch {
+    sub sx_sendrow_batch {
 
 # returns -1 for failure, >=0 for success
 
-      my $opt = $_[0];
-      my $dbh = $opt->{sx_dbh_to_bcp};
+        my $opt          = $_[0];
+        my $dbh          = $opt->{sx_dbh_to_bcp};
+        my $status_batch = -99;
 
-      my $status_batch = -99;
+#reset error flags before call to blk_done
+        ( $DB_ERROR, $DB_ERROR_ONELINE, $DB_DEADLOCK ) = ();
 
 #returns number of rows when it works, -1 on failure , or zero.
-#I dispute it'll return zero on error since zero is valid
-      $status_batch = $dbh->bcp_batch;
-      print "****strange case status_batch=$status_batch\n" if $DB_ERROR && $status_batch == 0;
+        my $numRowsAffected;
+        $status_batch = $dbh->blk_done( CS_BLK_BATCH, $numRowsAffected );
 
-      if( $status_batch < 0) {
-          $status_batch = sx_sendrow_batch_failure($opt, $status_batch); 
-      } else {
-          $status_batch = sx_sendrow_batch_success($opt, $status_batch);
-      }
+#      print "****strange case status_batch=$status_batch\n" if $DB_ERROR && $status_batch == 0;
+
+        if ( $status_batch != CS_SUCCEED || $DB_ERROR ) {
+            $status_batch = sx_sendrow_batch_failure($opt);
+        }
+        else {
+            $status_batch = sx_sendrow_batch_success( $opt, $numRowsAffected );
+        }
 
 #give back the storage
-       print scalar localtime() . " undefing\n" if $opt->{debug};
-       @{ $opt->{data_rows} } = undef if $status_batch > 0; #if $opt->{error_handling} =~ /^retry/i;
-       print scalar localtime() . " done undefing\n" if $opt->{debug};
+        print scalar localtime() . " undefing\n" if $opt->{debug};
+        @{ $opt->{data_rows} } = undef                if $status_batch > 0;    #if $opt->{error_handling} =~ /^retry/i;
+        print scalar localtime() . " done undefing\n" if $opt->{debug};
 
-      return $status_batch;
-   }
-
+        return $numRowsAffected;
+    }
 
 #---
 #
 #---
-   sub bcp_batch_error_handler {
+    sub bcp_batch_error_handler {
 
 #pull the args
-       my %h = @_;
-       my ($err, $line_num, $row_ref, $opt) = @h{qw/DB_ERROR row_num rows xfer_self/};
+        my %h = @_;
+        my ( $err, $line_num, $row_ref, $opt ) = @h{qw/DB_ERROR row_num rows xfer_self/};
 
 #return code definitions:
 #      rc = 0  : abort
 #      rc = 1  : resend and batch a record at a time
 #      rc > 1  : resend but in one batch
 #
-       my $rc = 0;
-       my ($st, $md, $v) = @{$opt}{qw/retry_deadlock_sleep retry_max retry_verbose/}; 
-
-       my $nd = ++$opt->{sx_num_retry};
-       sx_print($opt,"\nError detected on bcp_batch. Retry #$nd (max_retries=$md)\n") if $v;
-
-#check retry number
-       if($nd > $md) {
-          sx_print($opt, "max retries. aborting only this batch.\n\n") if $v;
-          $rc = 0;
-
-       } else {
+        my $rc = 0;
+        my ( $st, $md, $v ) = @{$opt}{qw/retry_deadlock_sleep retry_max retry_verbose/};
 
 #deadlock error.
-          my $deadlock if $err =~ /^.*error: 1205/m;
-          if($deadlock) { 
-              sx_print($opt,"It's a deadlock error! ") if $v; 
-              sx_print($opt, "sleeping for $st seconds.\n") if $v;
-              sleep $st;
-              $rc = 2; #force no one-by-one error reporting
+        my $deadlock = 1 if $err =~ /1205/m;
+
+#        my $deadlock = 1 if $err =~ /2601/m; #testing. simulate deadlock error with dupe key error
+        if ($deadlock) {
+            my $nd = ++$opt->{sx_num_retry};
+            if ( $nd > $md ) {
+                $opt->_print("------\n");
+                $opt->_print("max retries. aborting only this batch.\n\n");
+                $opt->_print("------\n");
+                $rc = 0;
+            }
+            else {
+
+                if ($v) {
+                    $opt->_print("------\n");
+                    $opt->_print("Error on blk_done. It's a deadlock error! Sleeping for $st seconds\n");
+                    $opt->_print("  $DB_ERROR_ONELINE\n");
+                    $opt->_print("------\n");
+                }
+                sleep $st;
+                $rc = 2;    #force no one-by-one error reporting
+            }
 
 #not a deadlock error. 
-           } else {
-              $rc = 1; #one at a time
+        }
+        else {
+            if ($v) {
+                $opt->_print("------\n");
+                $opt->_print(
+                    "Error on blk_done. It's NOT a deadlock error. Setting batch-size to one and resending batch.\n");
+                $opt->_print("  $DB_ERROR_ONELINE\n");
+                $opt->_print("------\n");
+            }
+            $rc = 1;    #one at a time
+
 #            $rc = 2; #testing
 
-           }
-       }
-       return ($rc, $row_ref);
-   }
-
-
+        }
+        return ( $rc, $row_ref );
+    }
 
 #----
 #resubmit the row
 #-----
-   sub sx_sendrow_batch_of_size {
-
+    sub sx_sendrow_batch_of_size {
 
 #
 #returns number of rows sent, >=1 success, <=0 bad
 #
-       my $opt = shift;
-       my $r_rows = shift;
-       my $new_batchsize = shift;
+        my $opt           = shift;
+        my $r_rows        = shift;
+        my $new_batchsize = shift;
 
-       my $rcount = 0;
-       my $elf = $opt->{sx_error_data_file_fh};
-       my $dbh = $opt->{sx_dbh_to_bcp};
-       foreach my $hp ( @{ $r_rows} ) {
-          my ($rn, $row) = ($hp->{rn}, $hp->{row});
-          $rcount++;
-          $opt->{sx_resend_count}++; 
-          $opt->{sx_resend_count_batch}++;
+        my $x = scalar @$r_rows;
+
+        my $rcount = 0;
+        my $elf    = $opt->{sx_error_data_file_fh};
+        my $dbh    = $opt->{sx_dbh_to_bcp};
+        foreach my $hp ( @{$r_rows} ) {
+            my ( $rn, $row ) = ( $hp->{rn}, $hp->{row} );
+            next unless $row;    #for some reason an undefined row is being stored
+            $rcount++;
+
+            $opt->{sx_resend_count}++;
+            $opt->{sx_resend_count_batch}++;
 
 #send row again
-          if($dbh->bcp_sendrow($row) == FAIL) {
-             local($") = "|";
-             print $elf "#recnum=$rn, reason=$DB_ERROR_ONELINE\n@$row\n";
-             next;
-          }
+            if ( $dbh->blk_rowxfer($row) == CS_FAIL ) {
+                local ($") = "|";
+                eval { print $elf "#recnum=$rn, reason=$DB_ERROR_ONELINE\n@$row\n"; };
+                print "eval error=$@\n" if $@;
+
+                next;
+            }
 
 #batch one by one only if batchsize is 1
-          if($new_batchsize == 1) {
-             my $status = $dbh->bcp_batch();
-             if($status != 1) { 
-                $opt->{sx_err_count}++;
-                $opt->{sx_err_count_batch}++;
-                local($") = "|";
-                print $elf "#recnum=$rn, reason=$DB_ERROR_ONELINE\n@$row\n";
-             } 
-          } 
-       }
+            if ( $new_batchsize == 1 ) {
+                my $numRowsAffected;
+                my $status = $dbh->blk_done( CS_BLK_BATCH, $numRowsAffected );
+                if ( $numRowsAffected != $new_batchsize ) {
+                    $opt->{sx_err_count}++;
+                    $opt->{sx_err_count_batch}++;
+                    local ($") = "|";
+                    print $elf "#recnum=$rn, reason=$DB_ERROR_ONELINE\n@$row\n";
+                }
+            }
+        }
 
-       my $num_good = ();
-       if($new_batchsize == 1) {
-          $num_good = $opt->{sx_resend_count_batch} - $opt->{sx_err_count_batch};
-          sx_sendrow_batch_success($opt, $num_good); #log message
+        my $num_good = ();
+        if ( $new_batchsize == 1 ) {
+            $num_good = $opt->{sx_resend_count_batch} - $opt->{sx_err_count_batch};
 
-       } else {
-          sx_sendrow_batch_success($opt, $num_good); #log message
-          $num_good = sx_sendrow_batch($opt);
-          $num_good = 0 if $num_good < 0;
-       }
- 
+#        $DB_IN_ERR_HANDLER = 1;
+            sx_sendrow_batch_success( $opt, $num_good );    #log message
+                                                            #        $DB_IN_ERR_HANDLER = 0;
+
+        }
+        else {
+            $num_good = sx_sendrow_batch($opt);
+
+            $num_good = 0 if $num_good < 0;
+            $DB_IN_ERR_HANDLER = 1;
+            sx_sendrow_batch_success( $opt, $num_good );    #log message
+            $DB_IN_ERR_HANDLER = 0;
+
+        }
+
 #log message
-       return $num_good;
+        return $num_good;
 
 #       return   sx_sendrow_batch_success($opt, $num_good);
-   }
-
+    }
 
 #-----
 #
 #-----
-   sub sx_sendrow_batch_success {
+    sub sx_sendrow_batch_success {
 
-          my $opt = shift;
-          my $status_batch = shift;
-         
+        my $opt          = shift;
+        my $status_batch = shift;
 
-          my $send_count = $opt->{sx_send_count};
-          $opt->{sx_succeed_count} += $status_batch;
-          if($opt->{progress_log}) {
-             my $suc = $opt->{sx_succeed_count};
-             my $res = $opt->{sx_resend_count};
-             my $fal = $opt->{sx_err_count} - $res;
-             my $bsuc= $opt->{sx_succeed_count_batch};
-             my $bres= $opt->{sx_resend_count_batch};
-             my $bfal= $opt->{sx_err_count_batch};
+        return $status_batch if $DB_IN_ERR_HANDLER;
+
+        my $send_count = $opt->{sx_send_count};
+        $opt->{sx_succeed_count} += $status_batch;
+        if ( $opt->{progress_log} ) {
+            my $suc  = $opt->{sx_succeed_count};
+            my $res  = $opt->{sx_resend_count};
+            my $fal  = $opt->{sx_err_count} - $res;
+            my $bsuc = $opt->{sx_succeed_count_batch};
+            my $bres = $opt->{sx_resend_count_batch};
+            my $bfal = $opt->{sx_err_count_batch};
 
 #if errors encountered then give a different log message. otherwise keep it simple
-             if($res) {
-               $opt->{override_silent}=1;
-               sx_print($opt, "   $status_batch rows committed [$suc/$send_count] (retries=$bres, fails=$bfal)\n");
-               $opt->{override_silent}=0;
-             } else {
-               sx_print($opt, "   $status_batch rows committed [$suc]\n");
-             }
-          }
+            if ($res) {
+                $opt->{override_silent} = 1;
+                $opt->_print("   $status_batch rows committed [$suc/$send_count] (retries=$bres, fails=$bfal)\n");
+                $opt->{override_silent} = 0;
+            }
+            else {
+                $opt->_print("   $status_batch rows committed [$suc]\n");
+            }
+        }
 
-          return  $status_batch;
-  }
-
+        return $status_batch;
+    }
 
 #-----------------------------------------------------------------------
 #set the return code from bcp_sendow
 #must return 1 for success (nsql thingy)
 #-----------------------------------------------------------------------
-  sub sx_sendrow_return {
+    sub sx_sendrow_return {
 
-     my $opt = shift;
-     my ($status_send, $status_batch, $status_cb_pre) = @_;
+        my $opt = shift;
+        my ( $status_send, $status_batch, $status_cb_pre ) = @_;
 
-     my $error = !($status_send && $status_batch && $status_cb_pre);
-     if($error) {
+        my $error = !( $status_send && $status_batch && $status_cb_pre );
+        if ($error) {
+
 #abort
-        if($opt->{error_handling} =~ /^abort$/i) { 
+            if ( $opt->{error_handling} =~ /^abort$/i ) {
 
 #batch failure already logged message
-           $status_batch && sx_print_error_detection($opt);
-           return 0;
+                $status_batch && $opt->_print_error_detection();
+                return 0;
 
 #plow thru errrors if so set
-        } else {
-           $DB_ERROR = ();
-           return 1;
-        }
+            }
+            else {
+                $DB_ERROR = ();
+                return 1;
+            }
 
 #clean return
-     } else {
-        return 1;
+        }
+        else {
+            return 1;
 
-     }
-  }
-
-
+        }
+    }
 
 #-----------------------------------------------------------------------
 #where to put messages
 #-----------------------------------------------------------------------
-   sub sx_print {
+    sub _print {
 
-     my ($opt, $line) = @_;
+        my ( $self, $line ) = @_;
 
 #we don't want to suppress print statements from SQL
-     my ($pack2) = caller(2);
+        my ($pack2) = caller(2);
 
 #some conditions must be overrieded like errors
-     my $force = $opt->{override_silent} ;
+        my $force = $self->{override_silent};
 
-     if($pack2 eq "Sybase::DBlib" || !$opt->{silent} || $force) {
-        ref($opt->{callback_print}) eq 'CODE' ?  $opt->{callback_print}->($line) : print "$line";
-     }
-   }
+        if ( $pack2 eq "Sybase::CTlib" || !$self->{silent} || $force ) {
+            ref( $self->{callback_print} ) eq 'CODE' ? $self->{callback_print}->($line) : print "$line";
+        }
+    }
 
+#-----
+#
+#-----
+    sub _dbiConnect {
+
+        my $self     = shift;
+        my $fromOrTo = shift;
+
+        my ( $dbih, $dbiDSN, $dbd, $where );
+        my ( $u,    $p,      $s,   $d, $a );
+
+#FROM side
+        if ( $fromOrTo =~ /from/i ) {
+            $where = 'FROM';
+
+            if ( $self->{from_dsn} =~ /^DBD/i ) {
+                ( $u, $p, $s, $d, $a ) = @{$self}{qw/from_user from_password from_server from_database app_name/};
+                $dbd = ( split /\./, $self->{from_dsn} )[1];
+            }
+            else {
+                sx_complain("brain-damage. can't make dbi connection on non-DBI FROM source\n");
+                return undef;
+            }
+
+#TO side
+        }
+        elsif ( $fromOrTo =~ /to/i ) {
+            $where = 'TO';
+            ( $u, $p, $s, $d, $a ) = @{$self}{qw/to_user to_password to_server to_database app_name/};
+            $dbd = 'Sybase';    #sjs needs to be changed! I know. I know.
+
+#error
+        }
+        else {
+            sx_complain("brain-damage. bad dbiConnect call\n");
+            return undef;
+
+        }
+
+        $a .= "_" . substr( $where, 0, 1 );
+
+#set the dbi dsn value
+        if ( $dbd =~ /^Sybase$/i ) {
+            $dbiDSN = "dbi:$dbd:server=$s;hostname=$ENV{HOSTNAME}";
+            $dbiDSN .= ";scriptName=$a";
+            $dbiDSN .= ";database=$d" if $d;
+        }
+        elsif ( $dbd =~ /^DB2$/i ) {
+            $dbiDSN = "dbi:$dbd:$s";
+        }
+
+#make the connection via DBI - we'll print our own error message
+        $dbih = DBI->connect( $dbiDSN, $u, $p, { RaiseError => 0, PrintError => 0 } );
+        $dbih || ( sx_complain("$where login error:\n$DB_ERROR(User=[$u], Pwd=[$p], Server=[$s])\n") && return undef );
+        if ( $dbd =~ /Sybase/i ) {
+            $dbih->{syb_err_handler} = sub { return $self->sx_error_handler_dbi(@_) };
+            $dbih->{syb_show_sql}++;
+            $dbih->{syb_show_eed}++;
+            $dbih->do("set flushmessage on");
+            $dbih->func( 'LONG', '_date_fmt' );    #need seconds + microseconds to xfer properly
+                                                   #set imagesize if asked to
+            my $imagesize = $self->{textsize} || 10_000_000;
+            $dbih->do("set textsize $imagesize");
+
+#use the above. this seems a little esoteric
+#            $dbih->ct_options(CS_SET, CS_OPT_TEXTSIZE, $imagesize, CS_INT_TYPE);
+
+        }
+
+#turn this back on for paranoia sake
+        $dbih->{PrintError} = 0;
+        $dbih->{RaiseError} = 1;
+
+        return $dbih;
+    }
+
+#---
+#
+#---
+    sub _ctConnect {
+
+        my ( $self, $fromOrTo ) = @_;
+        my ( $u, $p, $s, $d, $a );
+
+        if ( $fromOrTo =~ /from/i ) {
+            ( $u, $p, $s, $d, $a ) = @{$self}{qw/from_user from_password from_server from_database app_name/};
+            $a .= '_F';
+        }
+        else {
+            ( $u, $p, $s, $d, $a ) = @{$self}{qw/to_user to_password to_server to_database app_name/};
+            $a .= '_T';
+        }
+
+#specific error handlers
+        $self->{current_err_handler} = ct_callback( CS_SERVERMSG_CB, sub { $self->sx_error_handler(@_) } );
+        $self->{current_msg_handler} = ct_callback( CS_CLIENTMSG_CB, sub { $self->sx_message_handler(@_) } );
+
+#charset. this effects all open connections, alas.
+#      ?
+
+#only set the hostname property for now. we may want to set packetsize later.
+        my $props = { CON_PROPS => { CS_HOSTNAME => Sys::Hostname::hostname() } };
+
+        my $dbh = Sybase::CTlib->new( $u, $p, $s, $a, $props );
+        $DB_ERROR && sx_complain("[$fromOrTo] login error:\n$DB_ERROR(User=$u, Server=$s)\n") && return 1;
+
+#use the right database if specified
+        if($d) {
+           $dbh->nsql("use $d");
+           $DB_ERROR && sx_complain("unable to use database [$d].\n$DB_ERROR\n") && return 1;
+        }
+
+#binary/image/text size
+        my $imagesize = $self->{textsize} || 32_000;
+        my $r1 =$dbh->ct_options( CS_SET, CS_OPT_TEXTSIZE, $imagesize, CS_INT_TYPE );
+        if($r1 != CS_SUCCEED) {
+          sx_complain("unable to set textsize. text/image data may truncated\n");
+        }
+
+#date format - make it long so as milliseconds are present in the xfer
+        my $r2 = cs_dt_info(CS_SET, CS_DT_CONVFMT, CS_UNUSED, CS_DATES_LONG);
+        if ($r2 != CS_SUCCEED) {
+          sx_complain("error setting datetime format to 'LONG'. Datetime precision will be lost\n");
+        }
+
+#numerics greater than 2 gig do not translate to int nor float correctly so we keep them in 
+#their native format. 
+        $dbh->{UseNumeric} = 1;
+
+
+        return $dbh;
+
+    }
+
+#---
+#
+#---
+    sub _connectNonBcp {
+        my $self = shift;
+
+#allows connect via CTlib for now since there seems to be some conflict
+#using DBD::Sybase and Sybase::CTlib at the same time
+
+        if ( $self->{CTLib} ) {
+            return $self->_ctConnect(@_);
+
+        }
+        else {
+            return $self->_ctConnect(@_);
+
+#         return $self->_dbiConnect(@_);
+        }
+
+    }
+
+#---
+#
+#---
+    sub _tableDef {
+
+        my ( $self, $dbih, $table ) = @_;
+
+#for each line in the table file
+        my ( $db_name, $own_name, $tab_name ) = split ( /\./, $table );
+        $db_name  =~ s/\s+//g;
+        $own_name =~ s/\s+//g;
+        $tab_name =~ s/\s+//g;
+
+#create the sql
+        my $sql_string = <<EOF;
+         select col_name    = c.name,
+                type_name   = t.name,
+                col_len     = c.length,
+                col_order   = c.colid,
+                ctype       = c.type,
+                utype       = t.usertype,
+                allownulls  = convert(bit, (c.status & 8)),
+                prec        = c.prec,
+                isIdentity  = convert(bit, (c.status & 0x80))
+         from   $db_name.dbo.syscolumns c,
+                $db_name.dbo.systypes t
+         where  c.id = object_id('$db_name.$own_name.$tab_name')
+                and c.usertype *= t.usertype
+         order  by c.colid
+EOF
+
+#run the sql
+        my @h_pointers = $self->_runsql( $dbih, $sql_string, {}, undef );
+        $DB_ERROR && return undef;
+
+#re-organize
+        my %info = ();
+        for my $col ( @{ $h_pointers[0] } ) {
+            my $col_name = $col->{col_name};
+            $info{$db_name}->{$tab_name}->{$col_name}->{col_type}       = $col->{type_name};
+            $info{$db_name}->{$tab_name}->{$col_name}->{col_len}        = $col->{col_len};
+            $info{$db_name}->{$tab_name}->{$col_name}->{col_id}         = $col->{col_order};
+            $info{$db_name}->{$tab_name}->{$col_name}->{col_allownulls} = $col->{allownulls};
+            $info{$db_name}->{$tab_name}->{$col_name}->{col_prec}       = $col->{prec};
+            $info{$db_name}->{$tab_name}->{$col_name}->{col_identity}   = $col->{isIdentity};
+
+#if user-defined type, get underlying
+            if ( $col->{utype} > 100 ) {
+
+#i pulled this sql from sp_help
+                my $sql = <<EOF;
+               select  name
+               from    $db_name.$own_name.systypes
+               where   usertype < 100
+                       and type=$col->{ctype}
+                       and name not in ("sysname", "nchar", "nvarchar")
+EOF
+                my @name = $self->_runsql( $dbih, $sql, {}, undef );
+                $DB_ERROR && return undef;
+
+                $info{$db_name}->{$tab_name}->{$col_name}->{col_type}     = $name[0]->[0]->{name};
+                $info{$db_name}->{$tab_name}->{$col_name}->{col_usertype} = $col->{type_name};
+
+#not user-defined type
+            }
+            else {
+                $info{$db_name}->{$tab_name}->{$col_name}->{col_usertype} = undef;
+
+            }
+
+        }
+
+#add the list column names in the right order    
+        @{ $info{$db_name}->{$tab_name}->{__COLNAMES__} } =
+          sort { $info{$db_name}->{$tab_name}->{$a}->{col_id} <=> $info{$db_name}->{$tab_name}->{$b}->{col_id} }
+          keys %{ $info{$db_name}->{$tab_name} };
+
+        return \%info;
+    }
 
 #-----------------------------------------------------------------------
 #prep for xfer
 #-----------------------------------------------------------------------
-   sub sx_prep_xfer {
+    sub _prep_xfer {
 
 #args
-      my $opt = shift;
-
-
-#FROM connection
-     my $dbh_from = ();
-     my ($u,$p,$s,$a) = @{$opt}{qw/from_user from_password from_server app_name/};
-     unless( $opt->{from_perl} || $opt->{from_file}) {
-        $dbh_from = new Sybase::DBlib($u, $p, $s, $a . '_F');
-        $DB_ERROR && sx_complain("FROM login error:\n$DB_ERROR(User=$u, Server=$s)\n") && return 1;
-
-#use the right database
-        my $rs = $dbh_from->nsql("use $opt->{from_database}",'ARRAY') if($opt->{from_database});
-        $DB_ERROR && sx_complain("$DB_ERROR\n") && return 1;
-     }
-#squirrel it away
-     $opt->{sx_dbh_from} = $dbh_from;
-
+        my $self = shift;
 
 #little sub to split on keyword GO
-     my $split_on_go = sub {
-        my $sql = shift;
-        my $re = qr/^\s*GO\s*\n/mi;
-        my @s = split $re, $sql;
-        return @s > 1 ? \@s : $sql;
-     };
+        my $split_on_go = sub {
+            my $sql = shift;
+            my $re  = qr/^\s*GO\s*\n/mi;
+            my @s   = split $re, $sql;
+            return @s > 1 ? \@s : $sql;
+        };
 
+#log into <from> db if appropriate
+        my $dbh_from = ();
+        if ( $self->{from_dsn} =~ /^DBD/i ) {
 
-#select from 'from' source
-     my ($sql_source, $from_source, $from_detail) = ();
-
-#any sql
-     if( $opt->{from_sql} ) {
-        $sql_source = $opt->{from_sql};
-        $sql_source = $split_on_go->($sql_source); #allow multiple batches
-        $from_source = "$opt->{from_source}.$opt->{from_server}";
-        $from_detail = 'sql defined with -from_sql switch';
- 
-
-#file containing any sql
-     } elsif($opt->{from_script}) {
-        my $fn = $opt->{from_script};
-        open(FH1,"<$fn") or (sx_complain("unable to open script: <$fn>, $!\n") && return 1);
-        my @lines = <FH1>;
-        close(FH1);
-        $sql_source = join "", @lines;
-        $sql_source = $split_on_go->($sql_source); #allow multple batches
-        $from_source = "$opt->{from_source}.$opt->{from_server}";
-        $from_detail = "sql in file $fn";
-
-#table
-     } elsif($opt->{from_table}) {
-        my $wc = $opt->{where_clause} ? "where $opt->{where_clause}" : '';
-        $sql_source = "select * from $opt->{from_table} $opt->{holdlock} $wc";
-        $from_source = "$opt->{from_source}.$opt->{from_server}";
-        $from_detail = "$opt->{from_table}";
-
-#perl subroutine
-     } elsif( ref( $opt->{from_perl} ) eq "CODE" ) {
-        $sql_source = $opt->{from_perl};
-        $from_source = $opt->{from_source};
-        $from_detail = "perl sub $sql_source";
-
-#data file
-     } elsif( $opt->{from_file}) {
-        my $fn = $opt->{from_file};
-        $sql_source = new FileHandle "<$fn" or sx_complain("unable to open file: <$fn>, $!\n") and return 1;
-        $from_source = $opt->{from_source};
-        $from_detail = "$fn";
-
-     }
+#            $dbh_from = $self->_dbiConnect('FROM');
+            $dbh_from = $self->_connectNonBcp('FROM');
+            $dbh_from || return 1;
+        }
 
 #squirrel it away
-     $opt->{sx_sql_source} = $sql_source;
+        $self->{sx_dbh_from} = $dbh_from;
 
+#select from 'from' source
+        my ($xfer_source) = ();
+
+#from sql
+        if ( $self->{from_sql} ) {
+            $xfer_source = $split_on_go->( $self->{from_sql} );    #allow multiple batches
+
+#file containing any sql
+        }
+        elsif ( $self->{from_script} ) {
+            my $fn = $self->{from_script};
+            open( FH1, "<$fn" ) or ( sx_complain("unable to open script: <$fn>, $!\n") && return 1 );
+            $xfer_source = $split_on_go->( join '', <FH1> );    #allow multiple batches
+            close(FH1);
+
+#table
+        }
+        elsif ( $self->{from_table} ) {
+            my $wc = $self->{where_clause} ? "where $self->{where_clause}" : '';
+            $xfer_source = "select * from $self->{from_table} $self->{holdlock} $wc";
+
+#perl codeRef or ArrayRef
+        }
+        elsif ( $self->{from_perl} ) {
+            $xfer_source = $self->{from_perl};
+
+#data file
+        }
+        elsif ( $self->{from_file} ) {
+            my $fn = $self->{from_file};
+            if ( !ref($fn) ) {
+                if ( $fn =~ /\.gz$|\.zip$/i ) {
+                    $xfer_source = new FileHandle "zcat $fn |" or sx_complain("unable to open file: <$fn>, $!\n")
+                      and return 1;
+                }
+                else {
+                    $xfer_source = new FileHandle "<$fn" or sx_complain("unable to open file: <$fn>, $!\n") and return 1;
+                }
+            }
+            else {
+                $xfer_source = $fn;
+            }
+
+        }
+
+#squirrel it away
+        $self->{sx_xfer_source} = $xfer_source;
 
 #log into 'to' server (NON-BCP)
-     my %to_info = ();
-     my $dbh_to_non_bcp = new Sybase::DBlib($opt->{to_user}, $opt->{to_password}, 
-                          $opt->{to_server}, $opt->{app_name}.'_X');
-     $DB_ERROR && sx_complain("TO login error:\n$DB_ERROR\n") && return 1;
-     $dbh_to_non_bcp->nsql("set flushmessage on");
+        my %to_info = ();
 
+#        my $dbh_to  = $self->_dbiConnect('TO');
+        my $dbh_to = $self->_connectNonBcp('TO');
+        $dbh_to || return 1;
 
 #header report
-     if ( $opt->{progress_log} ) {
-        sx_print($opt, "Xfer info\n");
-        sx_print($opt, "   -from => $from_source.$from_detail\n");
-        sx_print($opt, "   -to   => $opt->{to_source}.$opt->{to_server}.$opt->{to_table}\n");
-     }
-    
+        if ( $self->{progress_log} ) {
+            $self->_print("Xfer info\n");
+            $self->_print("   -from => $self->{from_dsn}\n");
+            $self->_print( "   -to   => dbd." . "$self->{to_source}.$self->{to_server}.$self->{to_table}\n" );
+        }
+
 #check that -to_table exists
-     my @path = split(/\./, $opt->{to_table});
-     my $chk = "select count(*) from $path[0]..sysobjects where name = '$path[2]'";
-     my $chkn = ($dbh_to_non_bcp->nsql($chk, []) )[0];
-     ($DB_ERROR || !$chkn) && sx_complain("Can't find to_table <$opt->{to_table}>\n$DB_ERROR\n") && return 1;
-     
+        my @path = split ( /\./, $self->{to_table} );
+        my $chk = "select count(*) from $path[0]..sysobjects where name = '$path[2]'";
+        my @res = @{ $self->_runsql( $dbh_to, $chk, [], undef ) };
+        ( $DB_ERROR || !$res[0] ) && sx_complain("Can't find to_table <$self->{to_table}>\n$DB_ERROR\n") && return 1;
 
 #get to_table object info
-     %to_info = grab Sybase::ObjectInfo($dbh_to_non_bcp, undef, $opt->{to_table} );
-     $opt->{sx_to_info} = \%to_info;
-     ($opt->{sx_to_database}) = keys %to_info;
-     ($opt->{sx_to_table}) = keys %{ $to_info{ $opt->{sx_to_database} } };
-     my @cols = @{ $opt->{sx_to_info}->{ $opt->{sx_to_database} }->{$opt->{sx_to_table}}->{__COLNAMES__} };
-     sx_complain ("brain-damage. No columns found in target table\n"), return 1 unless @cols;
-     $opt->{sx_to_colnames} = \@cols;
+        my $toInfo = $self->_tableDef( $dbh_to, $self->{to_table} );
+        $self->{sx_to_info} = $toInfo;
+        ( $self->{sx_to_database} ) = keys %{$toInfo};
+        ( $self->{sx_to_table} )    = keys %{ $toInfo->{ $self->{sx_to_database} } };
+        my @cols = @{ $self->{sx_to_info}->{ $self->{sx_to_database} }->{ $self->{sx_to_table} }->{__COLNAMES__} };
+        sx_complain("brain-damage. No columns found in target table\n"), return 1 unless @cols;
+        $self->{sx_to_colnames} = [@cols];
+        $self->{sx_to_numcols} = scalar @cols;
 
 #use right db
-     my $rs = $dbh_to_non_bcp->nsql("use $opt->{sx_to_database}",'ARRAY') if $opt->{sx_to_database};
-     $DB_ERROR && sx_complain("$DB_ERROR\n") && return 1;
+        if ( $self->{sx_to_database} ) {
+            my $sql = "use $self->{sx_to_database}";
+            my $rs  = $self->_runsql( $dbh_to, $sql, undef, undef );
+
+#!           my $rs = $dbh_to_non_bcp->func("use $self->{sx_to_database}",  [], undef, 'nsql' );
+            $DB_ERROR && sx_complain("$DB_ERROR\n") && return 1;
+        }
+
+#check to charset for unicode and iso
+        $self->{sx_toCharSet} = $self->_checkCharSet( $dbh_to, 'TO');
+        $self->{sx_fromCharSet} = $self->_checkCharSet( $dbh_from, 'FROM');
+
 
 #squirrel away
-     $opt->{sx_dbh_to_non_bcp} = $dbh_to_non_bcp;
- 
+        $self->{sx_dbh_to_non_bcp} = $dbh_to;
+
 #check if delete flag specified
-     $opt->{delete_flag} && sx_delete_rows{$opt} && return 1;
-   
+        $self->{delete_flag} && sx_delete_rows {$self} && return 1;
+
 #check if truncate flag specified
-     $opt->{truncate_flag} && sx_truncate_table($opt) && return 1;
+        $self->{truncate_flag} && sx_truncate_table($self) && return 1;
 
 #create auto_delete commands
-     $opt->{auto_delete} && sx_auto_delete_setup($opt) && return 1;
+        $self->{auto_delete} && sx_auto_delete_setup($self) && return 1;
 
 #drop/recreate indices
-     $opt->{drop_and_recreate_indices} && sx_drop_indices($opt) && return 1;
-        
+        $self->{drop_and_recreate_indices} && $self->_drop_indices() && return 1;
+
 #debug. calc num rows to be xferred
-     if($opt->{debug} && $opt->{from_table}) {
-        sx_print($opt, "calculating number for rows to transfer.\n");
-        my $wc = "where $opt->{where_clause}" if $opt->{where_clause};
-        my $sql_string = "select count(*) from $opt->{from_table} $wc"; 
-        sx_print($opt, "$sql_string\n") if $opt->{echo} ;
-        my @status = $dbh_from->nsql($sql_string, []);
-        $DB_ERROR && sx_complain("$DB_ERROR\n") && return 1;
-        sx_print($opt, "num rows: $status[0]\n");
-     }
+        if ( $self->{debug} && $self->{from_table} ) {
+            $self->_print("calculating number for rows to transfer.\n");
+            my $wc = "where $self->{where_clause}" if $self->{where_clause};
+            my $sql_string = "select count(*) from $self->{from_table} $wc";
+            $self->_print("$sql_string\n") if $self->{echo};
+            my @status = @{ $self->_runsql( $dbh_from, $sql_string, [], undef ) };
 
-     return; 
-  }
+#!            my @status = $dbh_from->func( $sql_string, [], undef, 'nsql' );
+            $DB_ERROR && sx_complain("$DB_ERROR\n") && return 1;
+            $self->_print("num rows: $status[0]\n");
+        }
 
+        return;
+    }
 
+#-----
+#
+#-----
+    sub _checkCharSet {
+        my ( $self, $dbh, $where) = @_;
+
+#assume iso_1 if from source is not a database
+        return 'iso_1' unless $dbh;
+
+        my $sql  = qq/sp_configure "default character set id"/;
+        my @data = $self->_runsql( $dbh, $sql, {}, undef );
+        my $val  = $data[0]->[0]->{'Run Value'};
+        my $str = 0;
+        if ( $val == 190 ) {
+            $str = 'utf8';
+        }
+        elsif ( $val == 1 ) {
+            $str = 'iso_1'
+        }
+        else {
+            my $swi = $where eq 'TO' ? '--to_server' : '--from_server';
+            $self->_print("unknown charset on $swi: [$val]. Using iso_1\n");
+            $str = 'iso_1';
+        }
+        return $str;
+    }
 
 #-----------------------------------------------------------------------
 #make bcp connection
 #-----------------------------------------------------------------------
-  sub sx_open_bcp {
-     
-     my ($tab, $opt, $num_cols) = @_;
+    sub _open_bcp {
 
-     my $dbh = ();
-     &BCP_SETL(TRUE);
+        my ( $self, $tab, $num_cols ) = @_;
 
-     my ($u,$p,$s,$a) = @{$opt}{qw/to_user to_password to_server app_name/};
-     $dbh = new Sybase::DBlib($u, $p, $s, $a . '_T');
-     $DB_ERROR && sx_complain("TO login error:\n$DB_ERROR(User=$u, Server=$s)\n") && return 1;
+        my $dbh = ();
 
-     $dbh->bcp_init($tab, '', '', &DB_IN);
-     $DB_ERROR && sx_complain("$DB_ERROR\n") && return 1; 
+#specific error handlers
+        ct_callback( CS_SERVERMSG_CB, sub { $self->sx_error_handler(@_) } );
+        ct_callback( CS_CLIENTMSG_CB, sub { $self->sx_message_handler(@_) } );
 
-     $dbh->bcp_meminit($num_cols); 
-     $DB_ERROR && sx_complain("$DB_ERROR\n") && return 1;
+        my ( $u, $p, $s, $a, $cs ) = @{$self}{qw/to_user to_password to_server app_name sx_toCharSet/};
 
-     return $dbh;
+#bulk login connection property
+        my $props = {};
+        $props->{CS_BULK_LOGIN} = CS_TRUE;
 
-   }
+#character set property. eg. iso vs. unicode
+        $props->{CS_SYB_CHARSET} = $cs;
+
+#used for increasing the peformance of xferring text/image columns
+        $props->{CS_PACKETSIZE} = $self->{packetsize} if $self->{packetsize};
+
+#hostname 
+        $props->{CS_HOSTNAME} = Sys::Hostname::hostname(); 
+
+#program name. 'T' for 'To' or 'Target'.
+        my $programName = $a . '_T';
+
+#make connection
+        $dbh = Sybase::CTlib->new( $u, $p, $s, $programName, { CON_PROPS => $props } );
+        $DB_ERROR && sx_complain("TO login error:\n$DB_ERROR(User=$u, Server=$s)\n") && return 1;
+
+        my ($val, $rs);
+        if($self->{sx_fromCharSet} =~ /iso_1/i && $self->{sx_toCharSet} =~ /utf8/i) {
+           my $rs = $dbh->ct_con_props(CS_GET, CS_CHARSETCNV, $val, CS_INT_TYPE);
+        }
+
+#special checking for identity and image
+        my %to_info = %{ $self->{sx_to_info} };
+        my ( $idb, $itab ) = @{$self}{qw/sx_to_database sx_to_table/};
+        my @sorted_fields    = @{ $to_info{$idb}->{$itab}->{__COLNAMES__} };
 
 
+#set imagesize
+        my $imagesize = $self->{textsize} || 32_000;
+        $dbh->ct_options( CS_SET, CS_OPT_TEXTSIZE, $imagesize, CS_INT_TYPE );
+#---
+#image columns are returned as a *string* of hex digits in perl when using
+#a select statement. we'll have to convert it back to chars on the sendrow.
+#this code documents what columns to convert back.
+#---
+        my @sorted_binary = grep {$to_info{$idb}->{$itab}->{$_}->{col_type} =~ /(image|binary|timestamp)/ } @sorted_fields;
+        my @binary_col_num = ();
+        for my $c (@sorted_binary) {
+          push @binary_col_num, grep { $sorted_fields[$_] eq $c  } 0 .. $#sorted_fields;
+        }
+        $self->{binary_columns} = [ @binary_col_num ];
 
+
+#check identity column stuff
+        my @sorted_identity  = grep { $to_info{$idb}->{$itab}->{$_}->{col_identity} } @sorted_fields;
+        my @identity_col_num = ();
+        for my $c (@sorted_identity) {
+          push @identity_col_num, grep { $sorted_fields[$_] eq $c } 0 .. $#sorted_fields;
+        }
+
+
+#first one. remember id_column starts at one
+        my ( $has_identity, $id_column ) = ( undef, undef );
+
+#we want to carry over identity columns
+        if ( scalar(@identity_col_num) > 0 && $self->{set_identity_insert} ) {
+            ( $has_identity, $id_column ) = ( 1, $identity_col_num[0] + 1 );
+
+        }
+
+#we want server to set new identity columns
+        elsif ( scalar(@identity_col_num) > 0 && !$self->{set_identity_insert} ) {
+            ( $has_identity, $id_column ) = ( 0, $identity_col_num[0] + 1 );
+
+#if this is set then we will ensure this column is set to undef on the blk_xfer. column number is base 0.
+           $self->{identity_column} = $identity_col_num[0];
+
+        }
+
+#no identity column but the switch is set. that's okay...
+        elsif ( !(scalar(@identity_col_num) > 0) && $self->{set_identity_insert} ) {
+#            sx_complain("Identity column not found, but switch set_identity_insert specified\n") && return 1;
+        }
+
+
+#no identity and the switch isn't set and that's just fine
+        elsif ( !(scalar(@identity_col_num) > 0) && !$self->{set_identity_insert} ) {
+
+#no-op
+        }
+
+
+#initialize
+        print "init: <$tab> <$num_cols>, <$has_identity>, <$id_column>\n" if $self->{debug};
+        my $rc = $dbh->blk_init( $tab, $num_cols, $has_identity, $id_column );
+        if ( $rc == CS_FAIL || $DB_ERROR ) {
+            sx_complain("$DB_ERROR\n") && return 1;
+        }
+
+        return $dbh;
+
+    }
 
 #-----------------------------------------------------------------------
 #create the auto_delete string
 #-----------------------------------------------------------------------
-   sub sx_auto_delete_setup {
+    sub sx_auto_delete_setup {
 
 #args
-      my $opt = shift;
-      return 0 unless $opt->{auto_delete};
-     
+        my $opt = shift;
+        return 0 unless $opt->{auto_delete};
+
 #pull the necessary info off the options hash
-      my %to_info = %{ $opt->{sx_to_info} };
-      my($db) = keys %to_info;
-      my($table) = keys %{ $to_info{$db} };
+        my %to_info = %{ $opt->{sx_to_info} };
+        my ($db)    = keys %to_info;
+        my ($table) = keys %{ $to_info{$db} };
 
+        my $temp_db       = $opt->{scratch_db};
+        my $del_batchsize = $opt->{auto_delete_batchsize};
+        my $tmp_tab       = $opt->{sx_ad_temp_table} = "$temp_db..sybxfer$$";
 
-      my $temp_db = $opt->{scratch_db};
-      my $del_batchsize = $opt->{auto_delete_batchsize};
-      my $tmp_tab = $opt->{sx_ad_temp_table} = "$temp_db..sybxfer$$";
+        my $del_one_line = "delete $db..$table where";
+        my $del_join     = "delete $db..$table from $db..$table a, $tmp_tab b where";
 
-      my $del_one_line = "delete $db..$table where";
-      my $del_join = "delete $db..$table from $db..$table a, $tmp_tab b where";
 #create sql prefix
-      my $crt_sql = "create table $tmp_tab(";
+        my $crt_sql = "create table $tmp_tab(";
 
 #get the columns specified by the user
-      my @cols = split( /[\ ,]+/, $opt->{auto_delete} );
+        my @cols = split ( /[\ ,]+/, $opt->{auto_delete} );
 
-      my $columns = ();
+        my $columns = ();
 
 #loop thru the columns
-      for my $c (@cols) {
-         my ($val, $ctype) = ();
+        for my $c (@cols) {
+            my ( $val, $ctype ) = ();
 
 #if $c is all digits then its a column position
-         my $cname = ();
-         if($c =~ /^\d+$/) {
-           ($cname) = grep {$to_info{$db}->{$table}->{$_}->{col_id} == $c} @{ $to_info{$db}->{$table}->{__COLNAMES__} };
-           sx_complain("couldn't find column #$c in $table\n"), return 1 unless defined $cname;
-         } else {
-           $cname = $c;
-         }
+            my $cname = ();
+            if ( $c =~ /^\d+$/ ) {
+                ($cname) =
+                  grep { $to_info{$db}->{$table}->{$_}->{col_id} == $c } @{ $to_info{$db}->{$table}->{__COLNAMES__} };
+                sx_complain("couldn't find column #$c in $table\n"), return 1 unless defined $cname;
+            }
+            else {
+                $cname = $c;
+            }
 
 #get datatype
-         my $type = $to_info{$db}->{$table}->{$cname}->{col_type}   || sx_complain("unknown column: <$cname>\n");
-         my $col_num = $to_info{$db}->{$table}->{$cname}->{col_id}  || sx_complain("unknown column: <$cname>\n");
-         my $col_len = $to_info{$db}->{$table}->{$cname}->{col_len} || sx_complain("unknown column: <$cname>\n");
+            my $type    = $to_info{$db}->{$table}->{$cname}->{col_type} || sx_complain("unknown column: <$cname>\n");
+            my $col_num = $to_info{$db}->{$table}->{$cname}->{col_id}   || sx_complain("unknown column: <$cname>\n");
+            my $col_len = $to_info{$db}->{$table}->{$cname}->{col_len}  || sx_complain("unknown column: <$cname>\n");
 
 #list of columns
-         $columns .= "$cname,";
+            $columns .= "$cname,";
 
 #perl is zero indexed
-         $col_num--;
-         push @{ $opt->{sx_ad_col_num} }, $col_num;
+            $col_num--;
+            push @{ $opt->{sx_ad_col_num} }, $col_num;
 
 #add delimiters
-         if($type =~ /date|time/i) {  
-            $val = qq/$cname = '\${row[$col_num]}'/;
-            $ctype = $type;
-         } elsif($type =~ /char/i) {
-            $val = qq/$cname = '\${row[$col_num]}'/; 
-            $ctype = "$type($col_len)";
-         } elsif($type =~ /binary/i) { 
-            $val = qq/$cname = 0x\${row[$col_num]}/;
-            $ctype = "$type($col_len)";
-         } else { 
-            $val = qq/$cname = \${row[$col_num]}/;
-            $ctype = $type;
-         }
-      
+            if ( $type =~ /date|time/i ) {
+                $val   = qq/$cname = '\${row[$col_num]}'/;
+                $ctype = $type;
+            }
+            elsif ( $type =~ /char/i ) {
+                $val   = qq/$cname = '\${row[$col_num]}'/;
+                $ctype = "$type($col_len)";
+            }
+            elsif ( $type =~ /binary/i ) {
+                $val   = qq/$cname = 0x\${row[$col_num]}/;
+                $ctype = "$type($col_len)";
+            }
+            else {
+                $val   = qq/$cname = \${row[$col_num]}/;
+                $ctype = $type;
+            }
 
 #make cmds
-         $crt_sql .= " $cname $ctype null,";
-         $del_join .= " a.$cname = b.$cname and";
-         $del_one_line .= " $val and";
-      }
-
+            $crt_sql .= " $cname $ctype null,";
+            $del_join .= " a.$cname = b.$cname and";
+            $del_one_line .= " $val and";
+        }
 
 #remove trailing syntax
-      $columns = substr($columns,0,-1);
-      $crt_sql = substr($crt_sql,0,-1) . ") ";
-      $del_join = substr($del_join,0,-4);
-      $del_one_line = substr($del_one_line,0,-4);
-      my $crt_idx = "create index ix_$$ on $tmp_tab ( $columns ) "; 
-      my $upd_stat = "update statistics $tmp_tab ";
+        $columns      = substr( $columns,      0, -1 );
+        $crt_sql      = substr( $crt_sql,      0, -1 ) . ") ";
+        $del_join     = substr( $del_join,     0, -4 );
+        $del_one_line = substr( $del_one_line, 0, -4 );
+        my $crt_idx  = "create index ix_$$ on $tmp_tab ( $columns ) ";
+        my $upd_stat = "update statistics $tmp_tab ";
 
 #create the sql to delete the rows
-      my $del_sql = sx_delete_sql($del_join, $opt->{batchsize}, $opt->{silent});
+        my $del_sql = sx_delete_sql( $del_join, $opt->{batchsize}, $opt->{silent} );
 
-      $opt->{sx_ad_create_table} = $crt_sql;
-      $opt->{sx_ad_create_index} = $crt_idx;
-      $opt->{sx_ad_delete_cmd} = $del_sql;
-      $opt->{sx_ad_delete_join} = $del_join;   
-      $opt->{sx_ad_upd_stat} = $upd_stat;
+        $opt->{sx_ad_create_table} = $crt_sql;
+        $opt->{sx_ad_create_index} = $crt_idx;
+        $opt->{sx_ad_delete_cmd}   = $del_sql;
+        $opt->{sx_ad_delete_join}  = $del_join;
+        $opt->{sx_ad_upd_stat}     = $upd_stat;
 
-      return 0;
-   }
-
-
+        return 0;
+    }
 
 #-----------------------------------------------------------------------
 #sql to delete rows
 #-----------------------------------------------------------------------
-   sub sx_delete_sql {
+    sub sx_delete_sql {
 
-      my ($del_line, $batchsize, $silent) = @_;
+        my ( $del_line, $batchsize, $silent ) = @_;
 
-      return <<EOF;
+        return <<EOF;
       set rowcount $batchsize 
       declare \@loop int, \@tot_rows int, \@n int
       select \@loop=0, \@tot_rows=0, \@n=0
@@ -1645,327 +2254,338 @@ package Sybase::Xfer;
          $del_line
          select \@n=\@\@rowcount
          select \@tot_rows=\@tot_rows+\@n
-         if ( \@n > 0 and $silent <> 1) print "   \%1! rows deleted", \@n
+         if ( \@n > 0 and $silent <> 1) print "   \%1! rows deleted.", \@n
       end
       select loop=\@loop-1, tot_rows=\@tot_rows
       set rowcount 0
 EOF
-   }
-
-
+    }
 
 #-----------------------------------------------------------------------
 #oversize row info trace
 #-----------------------------------------------------------------------
-   sub sx_oversize_error {
+    sub sx_oversize_error {
 
-       my $opt     = shift;
-       my @row     = @{ +shift };
-       my $row_num = shift;
-       my $error   = shift;
+        my $opt     = shift;
+        my @row     = @{ +shift };
+        my $row_num = shift;
+        my $error   = shift;
 
 #ObjectInfo structure
-       my %to_info = %{ $opt->{sx_to_info} };
+        my %to_info = %{ $opt->{sx_to_info} };
 
-       my ($db, $tab) = @{ $opt }{qw/sx_to_database sx_to_table/};
+        my ( $db, $tab ) = @{$opt}{qw/sx_to_database sx_to_table/};
 
 #sort the fields by column order
-       my @sorted_fields = @{ $to_info{$db}->{$tab}->{__COLNAMES__} };
-       my @sorted_len = map { $to_info{$db}->{$tab}->{$_}->{col_len}  } @sorted_fields;
-       my @sorted_type= map { $to_info{$db}->{$tab}->{$_}->{col_type} } @sorted_fields;
-       my @sorted_prec= map { $to_info{$db}->{$tab}->{$_}->{col_prec} } @sorted_fields;
+        my @sorted_fields = @{ $to_info{$db}->{$tab}->{__COLNAMES__} };
+        my @sorted_len    = map { $to_info{$db}->{$tab}->{$_}->{col_len} } @sorted_fields;
+        my @sorted_type   = map { $to_info{$db}->{$tab}->{$_}->{col_type} } @sorted_fields;
+        my @sorted_prec   = map { $to_info{$db}->{$tab}->{$_}->{col_prec} } @sorted_fields;
 
 #check num columns in each
-       my $to_nc = scalar @sorted_fields;
-       my $from_nc = scalar @row;
+        my $to_nc   = scalar @sorted_fields;
+        my $from_nc = scalar @row;
 
-       sx_print($opt, "------------------\n");
-       sx_print($opt, "Expanded error log\n");
-       sx_print($opt, "   Error: $error");
-       sx_print($opt, "   note : num columns in source ($from_nc) != num columns in target ($to_nc)\n") if $from_nc != $to_nc;
-       sx_print($opt, "   row  : $row_num\n");
-       sx_print($opt, "   table: $db.$tab definitions with values on right.\n");
+        $opt->_print("------------------\n");
+        $opt->_print("Expanded error log\n");
+        $opt->_print("   Error: $error");
+        $opt->_print("   note : num columns in source ($from_nc) != num columns in target ($to_nc)\n") if $from_nc != $to_nc;
+        $opt->_print("   row  : $row_num\n");
+        $opt->_print("   table: $db.$tab definitions with values on right.\n");
 
 #loop thru all the fields
-       my $max = $to_nc > $from_nc ? $to_nc : $from_nc;
-       for (my $i=0; $i<$max; $i++) { 
+        my $max = $to_nc > $from_nc ? $to_nc : $from_nc;
+        for ( my $i = 0 ; $i < $max ; $i++ ) {
 
 #from data
-           my ($val, $act_len, $form) = ();
-           if($i < $from_nc) {
-              $val      = $row[$i];
-              $act_len  = length $row[$i];
-              $form = "      %2i: %-20s\t%-10s\t<%s>\n";
-           } else {
-              $val = "__not supplied__";
-              $act_len  = -1;
-              $form = "      %2i: %-20s\t%-10s\t%s\n";
-           }
+            my ( $val, $act_len, $form ) = ();
+            if ( $i < $from_nc ) {
+                $val     = $row[$i];
+                $act_len = length $row[$i];
+                $form    = "      %2i: %-20s\t%-10s\t<%s>\n";
+            }
+            else {
+                $val     = "__not supplied__";
+                $act_len = -1;
+                $form    = "      %2i: %-20s\t%-10s\t%s\n";
+            }
 
 #to data
-           my ($fld_name, $dec_type, $dec_len) = ();
-           if($i < $to_nc) {
-              $fld_name = $sorted_fields[$i];
-              $dec_type = $sorted_type[$i];
-              $dec_len  = $dec_type =~ /numeric/ ? $sorted_prec[$i] : $sorted_len[$i];
-           } else {
-              $fld_name = "__missing__";
-              $dec_type = "__missing__ ";
-              $dec_len  = " ";
-           }
+            my ( $fld_name, $dec_type, $dec_len ) = ();
+            if ( $i < $to_nc ) {
+                $fld_name = $sorted_fields[$i];
+                $dec_type = $sorted_type[$i];
+                $dec_len  = $dec_type =~ /numeric/ ? $sorted_prec[$i] : $sorted_len[$i];
+            }
+            else {
+                $fld_name = "__missing__";
+                $dec_type = "__missing__ ";
+                $dec_len  = " ";
+            }
 
 #expanded messages
-           my $msg = ();
-           if($dec_type =~ /char/i && $act_len > $dec_len && $act_len >= 0 ) { 
-              $msg = "       *Column #" . ($i+1) . " actual length [$act_len] > declared length [$dec_len]\n"; 
-              sx_print($opt, "$msg");
+            my $msg = ();
+            if ( $dec_type =~ /char/i && $act_len > $dec_len && $act_len >= 0 ) {
+                $msg = "       *Column #" . ( $i + 1 ) . " actual length [$act_len] > declared length [$dec_len]\n";
+                $opt->_print("$msg");
 
-           } elsif( $dec_type =~ /(int|float)/ && $val =~ /[^\+\-\.0-9]/  && $act_len >= 0) {
-              $msg = "       *Column #" . ($i+1) . " contains non-numeric data\n";
-              sx_print($opt, "$msg");
-           }  
+            }
+            elsif ( $dec_type =~ /(int|float)/ && $act_len >= 0 ) {
+                local $! = 0;
+                my ( $test, $err ) = POSIX::strtod($val);
+                if ($err) {
+                    $msg = "       *Column #" . ( $i + 1 ) . " contains non-numeric data\n";
+                    $opt->_print("$msg");
+                }
+            }
 
-           $dec_len = '(' . $dec_len . ')' if $dec_type !~ /missing/i;
-           my $line = sprintf $form, $i+1, $fld_name, $dec_type . $dec_len, $val;
-           sx_print($opt,$line); 
-       }
-       sx_print($opt, "------------------\n");
-       sx_print($opt,"\n");
-       return 0; 
+            $dec_len = '(' . $dec_len . ')' if $dec_type !~ /missing/i;
+            my $line = sprintf $form, $i + 1, $fld_name, $dec_type . $dec_len, $val;
+            $opt->_print($line);
+        }
+        $opt->_print("------------------\n");
+        $opt->_print("\n");
+        return 0;
     }
 
-   
 #-----------------------------------------------------------------------
 #check arguments
 #-----------------------------------------------------------------------
-   sub sx_checkargs {
-      
-      my @user_options = @_;
+    sub _checkargs {
+
+        my $self         = shift;
+        my @user_options = @_;
 
 #verify the options
-      my %opt = sx_verify_options(@user_options);
-      return 1 if exists $opt{1};
+        my %opt = sx_verify_options(@user_options);
+        return 1 if exists $opt{1};
 
 #if help or no options then give usage and bail
-      if(defined $opt{help} || ($opt{sybxfer} && keys %opt == 1)) {
-         sx_usage(\%opt), return 1;
-      }
+        if ( defined $opt{help} || ( $opt{sybxfer} && keys %opt == 1 ) ) {
+            sx_usage( \%opt ), return 1;
+        }
 
 #set some defaults
 #program_name in master..sysprocesses only 16 bytes long. need last two for sybxfer.
-      $opt{app_name} = basename($0) unless defined $opt{app_name}; 
-      $opt{app_name} = substr($opt{app_name},0,14);
-      $opt{progress_log} = 1 unless defined $opt{progress_log};
-      $opt{holdlock} = $opt{holdlock} ? 'HOLDLOCK' : '';
-      $opt{trim_whitespace} ||= 0;
-      $opt{silent} ||= 0;
-
+        $opt{app_name} = basename($0) unless defined $opt{app_name};
+        $opt{app_name} = substr( $opt{app_name}, 0, 14 );
+        $opt{progress_log} = 1 unless defined $opt{progress_log};
+        $opt{holdlock} = $opt{holdlock} ? 'HOLDLOCK' : '';
+        $opt{trim_whitespace} ||= 0;
+        $opt{silent} ||= 0;
 
 #if "U" specified, then make from and to equal to "user"
-      $opt{user} ||= $ENV{USER};
-      if($opt{user}) {
-         $opt{from_user} ||= $opt{user};
-         $opt{to_user}   ||= $opt{user};
-      }
+        $opt{from_user} ||= $opt{user} || $ENV{USER};
+        $opt{to_user} ||= $opt{user}   || $ENV{USER};
 
 #if "P" specified, then make from and to equal to "password"
-      $opt{password} ||= $opt{user} || $ENV{USER}; 
-      if($opt{password}) {
-         $opt{from_password} ||= $opt{from_user} || $opt{password};
-         $opt{to_password}   ||= $opt{to_user} || $opt{password};
-      }
-      
-#if "S" specified, then make from and to server equal to "server"
-      $opt{server} ||= $ENV{DSQUERY};
-      if($opt{server}) {
-         $opt{from_server} ||= $opt{server};
-         $opt{to_server}   ||= $opt{server};
-      }
-      
-#if "T" specified, then set from and to tables 
-      if($opt{table}) {
-         $opt{from_table} ||= $opt{table};
-         $opt{to_table}   ||= $opt{table};
-      }
+        $opt{from_password} ||= $opt{password} || $opt{from_user};
+        $opt{to_password} ||= $opt{password}   || $opt{to_user};
 
+#if "S" specified, then make from and to server equal to "server"
+        $opt{from_server} ||= $opt{server} || $ENV{DSQUERY};
+        $opt{to_server} ||= $opt{server}   || $ENV{DSQUERY};
+
+#if "T" specified, then set from and to tables 
+        if ( $opt{table} ) {
+            $opt{from_table} ||= $opt{table};
+            $opt{to_table} ||= $opt{table};
+        }
 
 #if "D" specified, then set database
-      if($opt{database}) {
-           $opt{from_database} ||= $opt{database};
-           $opt{to_database} ||= $opt{database};
-      }
+        if ( $opt{database} ) {
+            $opt{from_database} ||= $opt{database};
+            $opt{to_database} ||= $opt{database};
+        }
 
-#if "O" specified, then set origin (source)
-      if($opt{source}) {
-           $opt{from_source} ||= $opt{source};
-           $opt{to_source} ||= $opt{souce};
-      }
-        
- 
+#parse the --from_source switch
+        my $rc;
+        ( $rc, $opt{from_dsn} ) = $self->_parse_from_source( \%opt );
+        $rc && return 1;
 
-      
 #if batchsize not specified then force it to 1000
-      $opt{batchsize} = 1000 unless $opt{batchsize};
+        $opt{batchsize} = 1000 unless $opt{batchsize};
 
 #make sure no ambiguity/problems with -to_table 
-      if($opt{to_table}) {
-         my ($ok, $source, $server, $db, $own, $tab) = sx_parse_path($opt{to_table});
-         if ($ok ) {    
-             if( !$opt{to_database}  && !$db ) {
-                 sx_complain("-to_table should be of the form [db.][owner.]table if no -to_database specified\n") 
-                 && return 1; 
-             } 
-             if (!$opt{to_server} && !$server) {
-                 sx_complain("-to_table should be of the form [server.][db.][owner.]table if no -to_server specified\n") 
-                 && return 1; 
-             }
+        if ( $opt{to_table} ) {
+            my ( $ok, $source, $server, $db, $own, $tab ) = $self->_parse_path( \%opt, $opt{to_table} );
+            if ($ok) {
+                if ( !$opt{to_database} && !$db ) {
+                    sx_complain("-to_table should be of the form [db.][owner.]table if no -to_database specified\n")
+                      && return 1;
+                }
+
+                if ( !$opt{to_server} && !$server ) {
+                    sx_complain("-to_table should be of the form [server.][db.][owner.]table if no -to_server specified\n")
+                      && return 1;
+                }
+
 #we'll get to this later
 #             if (!$opt{to_source} && !$source) {
 #                 sx_complain("-to_table should be of the form [source.][server.][db.][owner.]table if no -to_source specified\n") 
 #                 && return 1; 
 #             }
-       
-             $opt{to_database} = $db || $opt{to_database};
-             $opt{to_server} = $server || $opt{to_server};
-             $opt{to_source} = $source || $opt{source} || 'Sybase';
-             if($own) {
-                $opt{to_table} = "$opt{to_database}.$own.$tab";
-             } else {
-                $opt{to_table} = "$opt{to_database}..$tab";
-             }
-         } else {
-             sx_complain("couldn't parse -to_table. form should be [db.][owner.]table\n") && return 1; 
-         }
-      } else {
-        sx_complain("-to_table MUST be specified\n") && return 1;
-      }
+
+                $opt{to_database} = $db     || $opt{to_database};
+                $opt{to_server}   = $server || $opt{to_server};
+                $opt{to_source}   = $source || $opt{source} || 'Sybase';
+                if ($own) {
+                    $opt{to_table} = "$opt{to_database}.$own.$tab";
+                }
+                else {
+                    $opt{to_table} = "$opt{to_database}..$tab";
+                }
+            }
+            else {
+                sx_complain("couldn't parse -to_table. form should be [db.][owner.]table\n") && return 1;
+            }
+        }
+        else {
+            sx_complain("-to_table MUST be specified\n") && return 1;
+        }
 
 #make sure no ambiguity/problems with -from_table 
-      if($opt{from_table}) {
-         my ($ok, $source, $server, $db, $own, $tab) = sx_parse_path($opt{from_table});
-         if ($ok ) {    
-             if( !$opt{from_database}  && !$db ) {
-                 sx_complain("-from_table should be of the form [db.][owner.]table if no -from_database specified\n") 
-                 && return 1; 
-             } 
-             if (!$opt{from_server} && !$server) {
-                 sx_complain("-from_table should be of the form [server.][db.][owner.]table if no -from_server specified\n") 
-                 && return 1; 
-             }
+        if ( $opt{from_table} ) {
+            my ( $ok, $source, $server, $db, $own, $tab ) = $self->_parse_path( \%opt, $opt{from_table} );
+            if ($ok) {
+                if ( !$opt{from_database} && !$db ) {
+                    sx_complain("-from_table should be of the form [db.][owner.]table if no -from_database specified\n")
+                      && return 1;
+                }
+
+                if ( !$opt{from_server} && !$server ) {
+                    sx_complain(
+                        "-from_table should be of the form [server.][db.][owner.]table if no -from_server specified\n")
+                      && return 1;
+                }
+
 #we'll get to this later
 #             if (!$opt{from_source} && !$source) {
 #                 sx_complain("-from_table should be of the form source.server.db.[owner].table if no -from_source specified\n") 
 #                 && return 1; 
 #             }
-       
-             $opt{from_database} = $db || $opt{from_database};
-             $opt{from_server} = $server || $opt{from_server};
-             $opt{from_source} = $source || $opt{from_source} || 'Sybase';
-             if($own) {
-                $opt{from_table} = "$opt{from_database}.$own.$tab";
-             } else {
-                $opt{from_table} = "$opt{from_database}..$tab";
-             }
-         } else {
-             sx_complain("couldn't parse -from_table. form should be [db.][owner.]table\n") && return 1; 
-         }
-      }
 
-
-
-
-
+#@                $opt{from_database} = $db     || $opt{from_database};
+#@               $opt{from_server}   = $server || $opt{from_server};
+#@                $opt{from_source}   = $source || $opt{from_source} || 'Sybase';
+#@                if ($own) {
+#@                    $opt{from_table} = "$opt{from_database}.$own.$tab";
+#@                }
+#@                else {
+#@                    $opt{from_table} = "$opt{from_database}..$tab";
+#@                }
+            }
+            else {
+                sx_complain("couldn't parse -from_table. form should be [db.][owner.]table\n") && return 1;
+            }
+        }
 
 #error handling
-      if(defined $opt{error_handling} && ! $opt{error_handling} =~ m/^(continue|abort|retry)/i) {
-         sx_complain("if -error_handling is specified it must be either abort/continue/retry\n") && return 1;
-      }
-      $opt{error_handling} = 'abort' unless defined $opt{error_handling};
-      if($opt{error_handling} =~ /retry/i ) {
-         if( !$opt{callback_err_batch}) {
-             $opt{callback_err_batch} = \&bcp_batch_error_handler;
-             sx_complain("Must specify -error_data_file if -error_handling = 'retry'\n"), return 1 unless($opt{error_data_file});
-         }
-      }
-      my $fn = $opt{error_data_file};
-      if($fn) {
-         $opt{sx_error_data_file_fh} = new FileHandle ">$fn";
-         sx_complain("Can't open <$fn> $!\n"), return 1 unless $opt{sx_error_data_file_fh};
-      }
+        if ( defined $opt{error_handling} && !$opt{error_handling} =~ m/^(continue|abort|retry)/i ) {
+            sx_complain("if -error_handling is specified it must be either abort/continue/retry\n") && return 1;
+        }
+        $opt{error_handling} = 'abort' unless defined $opt{error_handling};
+        if ( $opt{error_handling} =~ /retry/i ) {
+
+            if ( !$opt{callback_err_batch} ) {
+                $opt{callback_err_batch} = \&bcp_batch_error_handler;
+                sx_complain("Must specify -error_data_file if -error_handling = 'retry'\n"), return 1
+                  unless ( $opt{error_data_file} );
+            }
+        }
+        my $fn = $opt{error_data_file};
+
+        if ($fn) {
+            $opt{sx_error_data_file_fh} = new FileHandle ">$fn";
+            sx_complain("Can't open <$fn> $!\n"), return 1 unless $opt{sx_error_data_file_fh};
+        }
 
 #checks
-      if( $opt{error_handling} =~ /abort/i && 
-          ($opt{retry_max} || $opt{retry_verbose} || $opt{retry_deadlock_sleep} )) {
-          sx_complain("when -error_handling is 'abort', -retry_max, -retry_verbose, -retry_deadlock_sleep cannot be used\n");
-      }
+        if ( $opt{error_handling} =~ /abort/i && ( $opt{retry_max} || $opt{retry_verbose} || $opt{retry_deadlock_sleep} ) ) {
+            sx_complain(
+                "when -error_handling is 'abort', -retry_max, -retry_verbose, -retry_deadlock_sleep cannot be used\n");
+        }
 
 #default scratch db
-      $opt{scratch_db} = 'tempdb' unless $opt{scratch_db};
-      $opt{auto_delete_batchsize} = 3000 unless defined $opt{auto_delete_batchsize};
+        $opt{scratch_db}            = 'tempdb' unless $opt{scratch_db};
+        $opt{auto_delete_batchsize} = 3000     unless defined $opt{auto_delete_batchsize};
 
- 
 #--
 #deadlock retry
 #--
-      $opt{retry_max} = 3 unless defined $opt{retry_max};
-      $opt{retry_deadlock_sleep} = 120 unless defined $opt{retry_deadlock_sleep};
-      $opt{retry_verbose} = 1  unless defined $opt{retry_verbose};
-      $opt{save_deadlock_retry} = $Sybase::DBlib::nsql_deadlock_retrycount;
-      $opt{save_deadlock_sleep} = $Sybase::DBlib::nsql_deadlock_retrysleep;
-      $opt{save_deadlock_verbose} = $Sybase::DBlib::nsql_deadlock_verbose;
-      $Sybase::DBlib::nsql_deadlock_retrycount= defined $opt{retry_max} ? $opt{retry_max} : 3;
-      $Sybase::DBlib::nsql_deadlock_retrysleep= defined $opt{retry_deadlock_sleep} ? $opt{retry_deadlock_sleep} : 120;
-      $Sybase::DBlib::nsql_deadlock_verbose   = defined $opt{verbose} ? $opt{verbose} : 1;
+        $opt{retry_max}            = 3   unless defined $opt{retry_max};
+        $opt{retry_deadlock_sleep} = 120 unless defined $opt{retry_deadlock_sleep};
+        $opt{retry_verbose}        = 1   unless defined $opt{retry_verbose};
+        $opt{save_deadlock_retry}   = $Sybase::CTlib::nsql_deadlock_retrycount;
+        $opt{save_deadlock_sleep}   = $Sybase::CTlib::nsql_deadlock_retrysleep;
+        $opt{save_deadlock_verbose} = $Sybase::CTlib::nsql_deadlock_verbose;
+        $Sybase::CTlib::nsql_deadlock_retrycount = defined $opt{retry_max}            ? $opt{retry_max}            : 3;
+        $Sybase::CTlib::nsql_deadlock_retrysleep = defined $opt{retry_deadlock_sleep} ? $opt{retry_deadlock_sleep} : 120;
+        $Sybase::CTlib::nsql_deadlock_verbose    = defined $opt{verbose}              ? $opt{verbose}              : 1;
 
 #checks
-      unless ( $opt{to_server} ) {
-         sx_complain("Must specify -to server\n") && return 1;
-      }
+        unless ( $opt{to_server} ) {
+            sx_complain("Must specify -to server\n") && return 1;
+        }
 
-      unless ( $opt{to_table} ) {
-         sx_complain("Must specify -to table, use db.[owner].table syntax for safety.\n") && return 1;
-      }
+        unless ( $opt{to_table} ) {
+            sx_complain("Must specify -to table, use db.[owner].table syntax for safety.\n") && return 1;
+        }
 
-      unless ($opt{from_table} || $opt{from_script} || $opt{from_sql} || $opt{from_perl} || $opt{from_file}) {
-         sx_complain("Must specify -from table, -from_script, -from_sql, -from_perl or -from_file\n");
-         return 1;
-      }
-      if ($opt{from_table} || $opt{from_script} || $opt{from_sql}) { $opt{from_source} = 'Sybase' }
-      if ($opt{from_perl}) { $opt{from_source} = 'PERL-CODEREF' }
-      if ($opt{from_file}) { $opt{from_source} = 'FLAT-FILE' }
+        unless ( $opt{from_table} || $opt{from_script} || $opt{from_sql} || $opt{from_perl} || $opt{from_file} ) {
+            sx_complain("Must specify -from table, -from_script, -from_sql, -from_perl or -from_file\n");
+            return 1;
+        }
 
-      my $c = grep {defined $_ } @opt{qw/from_table from_script from_perl from_file/};
-      if($c > 1) {
-        sx_complain("-from_table, -from_script, -from_perl, -from_file are mutually exclusive\n") && return 1;
-      }
+#        if ( $opt{from_table} || $opt{from_script} || $opt{from_sql} ) { $opt{from_source} ||= 'Sybase' }
 
-      if ( ($opt{from_table} || $opt{from_script} || $opt{from_sql}) && !$opt{from_server}) { 
-         sx_complain("Must specify -from_server if -from_table, -from_script or -from_sql is specified\n");
-         return 1;
-      }
+        if ( $opt{from_perl} ) {
+            $opt{from_source} = 'PERL-CODEREF';
+        }
 
-      if( $opt{from_file} && !$opt{from_file_delimiter} ) {
-         sx_complain("Must specify -from_file_delimiter  if -from_file is specified\n") && return 1;
-      }
-      $opt{from_file_delimiter} = quotemeta $opt{from_file_delimiter} if length $opt{from_file_delimiter} == 1;
+        if ( $opt{from_file} && !ref( $opt{from_file} ) ) { $opt{from_source} = 'FLAT-FILE' }
+        if ( $opt{from_file} && ref( $opt{from_file} ) ) { $opt{from_source} = 'FILE-HANDLE' }
 
-      if($opt{from_file_delimiter} && !$opt{from_file}) {
-         sx_complain("Must specify -from_file if -from_file_delimiter is specified\n") && return 1;
-      }
+        my $c = grep { defined $_ } @opt{qw/from_table from_script from_perl from_file/};
+        if ( $c > 1 ) {
+            sx_complain("-from_table, -from_script, -from_perl, -from_file are mutually exclusive\n") && return 1;
+        }
 
-      $c = grep { defined $_} @opt{qw/auto_delete delete_flag truncate_flag/};
-      if($c > 1) {
-        sx_complain("-auto_delete, -delete_flag and -truncate_flag are mutually exclusive\n") && return 1;
-      }
+        if ( ( $opt{from_table} || $opt{from_script} || $opt{from_sql} ) && !$opt{from_server} ) {
+            sx_complain("Must specify -from_server if -from_table, -from_script or -from_sql is specified\n");
+            return 1;
+        }
 
+        if ( $opt{from_file} && !$opt{from_file_delimiter} && !$opt{from_file_pack_format} ) {
+            sx_complain("Must specify either -from_file_delimiter or -from_file_pack_format if -from_file is specified\n")
+              && return;
+        }
+        $opt{from_file_delimiter} = quotemeta $opt{from_file_delimiter} if length $opt{from_file_delimiter} == 1;
+
+        if ( $opt{from_file_delimiter} && !$opt{from_file} ) {
+            sx_complain("Must specify -from_file if -from_file_delimiter is specified\n") && return 1;
+        }
+
+        if ( $opt{from_file_pack_format} && !$opt{from_file} ) {
+            sx_complain("Must specify -from_file if -from_file_pack_format is specified\n") && return 1;
+        }
+        $c = grep { defined $_ } @opt{qw/from_file_delimiter from_file_pack_format/};
+        if ( $c > 1 ) {
+            sx_complain("-from_file_delimiter, -from_file_pack_format are mutually exclusive\n") && return 1;
+        }
+
+        $c = grep { defined $_ } @opt{qw/auto_delete delete_flag truncate_flag/};
+        if ( $c > 1 ) {
+            sx_complain("-auto_delete, -delete_flag and -truncate_flag are mutually exclusive\n") && return 1;
+        }
 
 #----
 #check -from_file_map syntax
 #----
-      my $err = ();
-      $opt{from_file_map} and (undef, $err) = sx_parse_user_hash($opt{from_file_map}, '-from_file_map');
-      if($err) {
-           sx_complain(<<EOF);
+        my $err = ();
+        $opt{from_file_map} and ( undef, $err ) = sx_parse_user_hash( $opt{from_file_map}, '-from_file_map' );
+        if ($err) {
+            sx_complain(<<EOF);
 error parsing -from_file_map, err=$err
 
 syntax is:  -from_file_map [hashref | string | filename | 0]
@@ -1984,326 +2604,318 @@ syntax is:  -from_file_map [hashref | string | filename | 0]
    is used
 EOF
             return 1;
-       }
-
+        }
 
 #---
 #check -drop_and_recreate_indices
 #---
-       my (%dari, $dari) = ();
-       if(defined $opt{drop_and_recreate_indices} && $opt{drop_and_recreate_indices} !~ /^[01]$/) {
-            ($dari, $err) = sx_parse_user_hash($opt{drop_and_recreate_indices}, '-drop_and_recreate_indices');
-       }
-       if (!$err && $dari) {
-           %dari = %$dari;
-           !exists $dari{syts} and $err = "key 'syts' not found";
-           !exists $dari{source} and $err = "key 'source' not found";
+        my ( %dari, $dari ) = ();
+        if ( defined $opt{drop_and_recreate_indices} && $opt{drop_and_recreate_indices} !~ /^[01]$/ ) {
+            ( $dari, $err ) = sx_parse_user_hash( $opt{drop_and_recreate_indices}, '-drop_and_recreate_indices' );
+        }
+
+        if ( !$err && $dari ) {
+            %dari = %$dari;
+            !exists $dari{syts}   and $err = "key 'syts' not found";
+            $dari{syts} && !exists $dari{source} and $err = "key 'source' not found";
+
 #defaults
-           if(!defined $dari{logfile} ) {$dari{logfile} = 'stdout'}
-           if($dari{logfile} eq '0') {$dari{logfile} = '/dev/null'}
-       }
+            $dari{logfile} = 'stdout' unless defined $dari{logfile};
+            $dari{logfile} = '/dev/null' if $dari{logfile} eq '0';
+            $dari{sytsUser} = $opt{to_user}   unless defined $dari{sytsUser};
+            $dari{sytsPwd}  = $dari{sytsUser} unless defined $dari{sytsPwd};
+            $dari{withSortedData} = 0 unless defined $dari{withSortedData};
+        }
 
 #print error
-       if($err) {
-           sx_complain(<<EOF);
+        if ($err) {
+            sx_complain(<<EOF);
 error parsing -drop_and_recreate_indices, err=$err
 
-syntax is:  -drop_and_recreate_indices [hashref | string | filename | 0]
-   * hashref   => is a perl hash ref
-
-   * string    => is of the form '(syts=>1, source=>"server.database", logfile=>"filename")'
-                  syts indicates to use syts
-                  server.database is where the -to_table exists with indices
-                  filename is the logfile. omit if stdout desired.
-
-   * filename  => is name of file containing above string
+syntax is:  -drop_and_recreate_indices [hashref | string | filename | 0 | 1]
+   * 1         => same as -drop_and_recreate_indices
 
    * 0         => same as -NOdrop_and_recreate_indices
 
-   DO NOT use a value for this switch unless you wish to invoke MorganStanley's syts application.
+   * hashref   => is a perl hash ref
+
+   * string    => is of the form: 
+                  '(syts=>1/0, source=>"server.database", logfile=>"filename", sytsUser=>user, sytsPwd=>pwd, withSortedData=>0/1)'
+                  syts indicates to use syts
+                  server.database is where the -to_table exists with indices.
+                  filename is the logfile. omit if stdout desired.
+                  user is the syts user. default is -to_user.
+                  pwd is the syts pwd. default is user.
+
 EOF
-           return 1;
-       }
+            return 1;
+        }
+
 #squirrel away
-       if(%dari) {
-          $opt{sx_drop_and_recreate_indices} = \%dari;
-       } else {
-          $opt{sx_drop_and_recreate_indices} = {syts=>0};
-       }
+        if (%dari) {
+            $opt{sx_drop_and_recreate_indices} = \%dari;
+        }
+        else {
+            $opt{sx_drop_and_recreate_indices} = { syts => 0 };
+        }
 
+#auto delete
+        if ( $opt{auto_delete} && !$opt{from_table} ) {
+            sx_complain("switch -auto_delete can only be used with -from_table\n");
+            return 1;
+        }
 
-#----
-#check -truncate_flag
-#---
+        return %opt;
+    }
 
-
-
-      return %opt;
-   }
-
-
-#-----
+#-------------------------------------------------------
 #parse source path
-#-----
-   sub sx_parse_path {
-      my $path = shift;
+#-------------------------------------------------------
+    sub _parse_path {
+        my ( $self, $opt, $path ) = @_;
 
-      my @parts = split /\./, $path;
-      my ($ok, $source, $server, $db, $own, $tab);
-      if( @parts <= 5) {
-         ($source, $server, $db, $own, $tab) = @parts if @parts == 5;
-         ($server, $db, $own, $tab) = @parts if @parts == 4;
-         ($db, $own, $tab) = @parts if @parts == 3;
-         ($own, $tab) = @parts if @parts == 2;
-         ($tab) = @parts if @parts == 1;
-         $ok=1;
-      } else {
-         $ok=0;
-      }
-      return ($ok, $source, $server, $db, $own, $tab);
+        my @parts = split /\./, $path;
+        my ( $ok, $source, $server, $db, $own, $tab );
+        if ( @parts <= 5 ) {
+            ( $source, $server, $db, $own, $tab ) = @parts if @parts == 5;
+            ( $server, $db, $own, $tab ) = @parts if @parts == 4;
+            ( $db, $own, $tab ) = @parts if @parts == 3;
+            ( $own, $tab ) = @parts if @parts == 2;
+            ($tab) = @parts if @parts == 1;
+            $ok = 1;
+        }
+        else {
+            $ok = 0;
+        }
+        return ( $ok, $source, $server, $db, $own, $tab );
 
     }
 
 #-----------------------------------------------------------------------
 #confirm options and load massaged options
 #-----------------------------------------------------------------------
-     sub sx_verify_options { 
+    sub sx_verify_options {
 
-      my @user_settings = @_;
+        my @user_settings = @_;
 
 #need to preserve order for options processing
-      my %user_settings = ();
-      tie %user_settings, "Tie::IxHash";
+        my %user_settings = ();
+        tie %user_settings, "Tie::IxHash";
 
-      my $i=0;
-      while($i<@user_settings) {
-          my ($k,$v) = ($user_settings[$i], $user_settings[$i+1]);
+        my $i = 0;
+        while ( $i < @user_settings ) {
+            my ( $k, $v ) = ( $user_settings[$i], $user_settings[ $i + 1 ] );
 
 #this means flag style option if the next option starts with a '-'
-          if($v =~ /^\-\w/ || $i == $#user_settings && $k =~ /^\-\w/) { 
-             $v = 1;
-             $i++;
-          } else {
-             $i += 2;
-          }
-          $user_settings{"$k"} = $v;
+            if ( $v =~ /^\-\w/ || $i == $#user_settings && $k =~ /^\-\w/ ) {
+                $v = 1;
+                $i++;
+            }
+            else {
+                $i += 2;
+            }
+            $user_settings{"$k"} = $v;
 
-      }           
-    
+        }
+
 #the list of options
-      my @valid_options = 
-                     qw/help|h|?:s
-                        from_server|fs=s
-                        from_user|fu=s
-                        from_password|fp=s
-                        from_database|fd=s
+        my @valid_options =
+          qw/
+          help|h|?:s
 
-                        from_table|ft=s
-                        from_script=s
-                        from_sql=s
-                        from_perl=s
-                        from_file|ff=s
-                        from_file_delimiter|ffd=s
-                        from_file_map|ffm|map:s
+          from_source|fx=s
+          from_server|fs=s
+          from_user|fu=s
+          from_password|fp=s
+          from_database|fd=s
 
-                        to_server|ts=s
-                        to_user|tu=s
-                        to_password|tp=s
-                        to_table|tt=s
-                        to_database|td=s
+          from_table|ft=s
+          from_script=s
+          from_sql=s
+          from_perl=s
+          from_file|ff=s
+          from_file_delimiter|ffd=s
+          from_file_map|ffm|map:s
+          from_file_pack_format|ffpf=s
 
-                        user|U=s
-                        password|P=s
-                        server|S=s
-                        table|T=s
-                        database|D=s
+          to_server|ts=s
+          to_user|tu=s
+          to_password|tp=s
+          to_table|tt=s
+          to_database|td=s
 
-                        delete_flag|df:s
-                        truncate_flag|tf:s
-                        where_clause|wc=s
-                        batchsize|bs=i
-                        holdlock|hl:s
-                        trim_whitespace|tw:s
-                        timeout|to=i
-                        drop_and_recreate_indices|dari:s
-                       
-                        scratch_db=s
-                        auto_delete=s
-                        auto_delete_batchsize|adb=i
-           
-                        debug=s
-                        echo:s
-                        silent:s
-                        progress_log|verbose:s
-                        app_name|an=s
-                        
-                        error_handling|eh=s
-                        error_data_file|edf=s
-                        retry_max=s
-                        retry_deadlock_sleep|rds=s
-                        retry_verbose|rv=s
+          user|U=s
+          password|P=s
+          server|S=s
+          table|T=s
+          database|D=s
 
-                        callback_err_send=s
-                        callback_err_batch=s
-                        callback_pre_send=s
-                        callback_print=s
-   
-                        sybxfer:s
-                        return:s
-                     /;
+          delete_flag|df:s
+          truncate_flag|tf:s
+          where_clause|wc=s
+          batchsize|bs=i
+          holdlock|hl:s
+          trim_whitespace|tw:s
+          timeout|to=i
+          drop_and_recreate_indices|dari:s
+          copy_source_indices|csi!
+          set_identity_insert|sii:s
+          textsize|txs:s
+          packetsize|ps:s
 
+          scratch_db=s
+          auto_delete=s
+          auto_delete_batchsize|adb=i
 
-#sub to pull code ref's
-#@      my $sub = sub {
-#@                my $key = shift; 
-#@                my $cb = ();
-#@                if(exists $user_settings{$key}) {
-#@                  if(ref($user_settings{$key}) eq 'CODE') {
-#@                     $cb = $user_settings{$key};
-#@                     delete $user_settings{$key};
-#@                  } else { sx_complain("$key must be a CODE reference\n") if $user_settings{$key}; } #can be undef
-#@                }
-#@                return $cb;
-#@      };
+          debug=s
+          echo:s
+          silent:s
+          progress_log|verbose:s
+          app_name|an=s
 
+          error_handling|eh=s
+          error_data_file|edf=s
+          retry_max=s
+          retry_deadlock_sleep|rds=s
+          retry_verbose|rv=s
 
-#code references aren't handled all that great by GetOptions. so. pull these out and put 'em back in 
-#why do I say this? GetOptions was actually calling the code ref.
-#@      my $cb_pl = $sub->('-from_perl');
-#@      my $cb_ps = $sub->('-callback_pre_send');
-#@      my $cb_es = $sub->('-callback_err_send');
-#@      my $cb_eb = $sub->('-callback_err_batch');
-#@      my $cb_pr = $sub->('-callback_print');
+          callback_err_send=s
+          callback_err_batch=s
+          callback_pre_send=s
+          callback_print=s
 
+          sybxfer:s
+          return:s
+          method:s
+          /;
 
-#save ARGV
-#@      my @SAVE_ARGV = @ARGV;
+        use vars qw/%real_options/;
 
-      use vars qw/%real_options/;
+        do {
+            local $SIG{__WARN__} = sub { sx_complain("$_[0]") };
 
-      do { 
-          local $SIG{__WARN__} = sub { sx_complain("$_[0]") };
 #load up ARGV for GetOptions
-          %real_options = ();
-          local @ARGV = %user_settings;
-          Getopt::Long::Configure(qw/no_ignore_case/);
-          my $rs = GetOptions(\%real_options, @valid_options);
-          $rs || return 1;
-      };
+            %real_options = ();
+            local @ARGV = %user_settings;
+            Getopt::Long::Configure(qw/no_ignore_case/);
+            my $rs = GetOptions( \%real_options, @valid_options );
+            $rs || return 1;
+        };
 
-#restore ARGV
-#@      @ARGV = @SAVE_ARGV;
-
-#put the code ref's back in
-#@      $real_options{from_perl} = $cb_pl if $cb_pl;
-#@     $real_options{callback_pre_send} = $cb_ps if $cb_ps;
-#@     $real_options{callback_err_send} = $cb_es if $cb_es;
-#@     $real_options{callback_err_batch} = $cb_eb if $cb_eb;
-#@      $real_options{callback_print} = $cb_pr if $cb_pr;
-
-      return %real_options;
-   }
-
+        return %real_options;
+    }
 
 #-----------------------------------------------------------------------
 #complain
 #-----------------------------------------------------------------------
-   sub sx_complain {
+    sub sx_complain {
 
-       my $msg = shift;
-       warn "----------------\n";
-       warn "$msg";
-       warn "----------------\n";
-       return 1;
+        my $msg = shift;
+        warn "----------------\n";
+        warn "$msg";
+        warn "----------------\n";
+        return 1;
 
-   }
-
-
+    }
 
 #-----------------------------------------------------------------------
 #this is copied from nsql_error_handler. I might change it later.
 #-----------------------------------------------------------------------
     sub sx_error_handler {
-       my ($self, $db, $severity, $error, $os_error, $error_msg, $os_error_msg) = @_;
+        my $self = shift;
+        shift;    #dbh not needed.
+        return $self->sx_error_handler_dbi(@_);
+    }
 
-#check the error code to see if we should report this.
-       if ( $error != SYBESMSG ) {
-         $DB_ERROR = "Sybase error: $error - $error_msg\n";
-         $DB_ERROR .= "OS Error: $os_error_msg\n" if defined $os_error_msg;
-         $DB_ERROR_ONELINE = "Sybase error: $error - $error_msg";
-       }
+#-----
+#
+#-----
+    sub sx_error_handler_dbi {
 
-       INT_CANCEL;
-   }
+        my ( $self, $number, $sev, $state, $line, $server, $proc, $msg ) = @_;
 
+        $DB_DEADLOCK = 1 if $number == 1205 ? 1 : undef;
+        $DB_ERROR         = undef;
+        $DB_ERROR_ONELINE = undef;
+
+#ignore these
+# 5701    #changed db context
+# 5703    #changed language
+# 5704    #changed character set
+
+        return 1 if grep { $_ == $number } ( 5701, 5703, 5704 );
+
+#print messages are severity 10
+        if ( $sev == 10 ) {
+            print "$msg\n";
+
+        }
+        else {
+            chomp($msg);
+            $DB_ERROR = <<EOF;
+Sybase::Xfer [Error Handler]
+  Server   : $server
+  Number   : $number
+  Severity : $sev
+  Line     : $line
+  Text     : $msg
+EOF
+            $DB_ERROR_ONELINE = "SybaseError:server=$server:number=$number:text=$msg";
+        }
+        return 1;
+    }
 
 #-----------------------------------------------------------------------
-#prints sql 'print' code via sx_print
+#prints sql 'print' code via _print
 #-----------------------------------------------------------------------
-   sub sx_message_handler {
-      my ($opt, $db, $message, $state, $severity, $text, $server, $procedure, $line) = @_;
- 
-#
-#open servers often do not set severity right for the following 3 messages so we'll check
-#the explicit numbers here since these 'errors' are purely informational
-#
-      if ( $severity > 0 
-           && $message != 5701  #changed db context
-           && $message != 5703  #changed language
-           && $message != 5704  #changed character set
-       ) {
-         
-         $DB_ERROR = "Sybase error: $message\n";
-         $DB_ERROR .= "Severity: $severity\n";
-         $DB_ERROR .= "State: $state\n";
-         $DB_ERROR .= "Server: $server\n"        if defined $server;
-         $DB_ERROR .= "Procedure: $procedure\n"  if defined $procedure;
-         $DB_ERROR .= "Line: $line\n"            if defined $line;
-         $DB_ERROR .= "Text: $text\n";
- 
-         return unless ref $db;
- 
-         my $lineno = 1;
-         foreach my $row ( split(/\n/,$db->dbstrcpy) ) {
-             $DB_ERROR .= sprintf ("%5d", $lineno ++) . "> $row\n";
-         }
-         $DB_ERROR_ONELINE = "$message $text";
+    sub sx_message_handler {
+
+#   my ( $opt, $db, $message, $state, $severity, $text, $server, $procedure, $line ) = @_;
+
+        my ( $self, $layer, $origin, $severity, $number, $msg, $osmsg, $dbh ) = @_;
+
+#ignore these
+# 5701    #changed db context
+# 5703    #changed language
+# 5704    #changed character set
+
+        return CS_SUCCEED if grep { $_ == $number } ( 5701, 5703, 5704 );
+
+#set DB_ERROR
+        $DB_ERROR .= "\nOpen Client Message:\n";
+        $DB_ERROR .= sprintf( "Message number: LAYER = (%ld) ORIGIN = (%ld) ", $layer,    $origin );
+        $DB_ERROR .= sprintf( "SEVERITY = (%ld) NUMBER = (%ld)\n",             $severity, $number );
+        $DB_ERROR .= "Message String: $msg\n";
+        $DB_ERROR .= sprintf( "Operating System Error: %s\n", $osmsg ) if defined $osmsg;
+        $DB_ERROR_ONELINE = "$number $msg";
 
 #force nosilent on errors.
-         $opt->{override_silent}++;
- 
- 
-#grab messages of severity = 0 (print messages)
-    } else {
- 
-      unless($message =~ m/^(5701|5703|5704)$/) {
-          sx_print($opt, "$text\n");
-      }
- 
+        $self->{override_silent}++;
+        $self->_print("$msg\n");
+
+        CS_SUCCEED;
     }
- 
-    return 0;
-  }
 
-
+#-----
 #
-#
-#
-  sub sx_drop_indices_setup {
+#-----
+    sub _drop_indices_setup {
 
-     my $self = shift;
+        my $self = shift;
+        my ($dbh, $db, $tab) = @_;
 
-     my $dbh_to_non_bcp = $self->{sx_dbh_to_non_bcp};
+        my %dari = %{ $self->{sx_drop_and_recreate_indices} };
 
-     my $sql = <<EOF . "\n";
-     declare \@db varchar(40), \@objname varchar(100)
-     select \@db='$self->{sx_to_database}', \@objname='$self->{sx_to_table}'
+        my $sql = <<EOF . "\n";
+     declare \@db varchar(40), \@objname varchar(100), \@withSortedData int
+     select \@db='$db', \@objname='$tab'
+     select \@withSortedData=$dari{withSortedData}
 EOF
 
-     $sql = $sql . <<'EOF';
+        $sql = $sql . <<'EOF';
 set nocount on
 declare @keys varchar(255), @indid int, @nk int
-declare @inddesc varchar(255), @idx_name varchar(40), @cluster varchar(20), @options varchar(20)
+declare @inddesc varchar(255), @idx_name varchar(40), @cluster varchar(20), @options varchar(50)
 declare @uniq varchar(12), @dev varchar(40)
 select @nk=0
 
@@ -2480,6 +3092,16 @@ begin
         from    sysindexes
         where   id = object_id(@objname) and indid = @indid
 
+        if(@withSortedData <> 0 and @cluster = 'clustered') 
+        BEGIN
+--            print "before = [%1!]", @options
+            select @options=case when @options <> null 
+                                then @options + ', sorted_data' 
+                                else 'sorted_data'
+                           end
+--            print "after = [%1!]", @options
+        END
+
         if @options <> null select @options='with ' + @options
 
 --debug
@@ -2492,6 +3114,7 @@ begin
 --
         select create_index='create '+@uniq+' '+@cluster+' index '+@idx_name+' on '+
                              @db+'..'+@objname+'('+@keys+') '+@options+' on '+"'"+@dev+"'",
+
                drop_index='drop index '+@objname+'.'+@idx_name, 
 
                idx_name=@idx_name
@@ -2508,58 +3131,61 @@ end
 EOF
 
 #run the sql
-     my @idx = $dbh_to_non_bcp->nsql($sql,{});
-     $DB_ERROR && sx_complain("$DB_ERROR\n") && return 1;
+        my @idx = @{ $self->_runsql( $dbh, $sql, {}, undef ) };
+        $DB_ERROR && sx_complain("$DB_ERROR\n") && return 1;
 
 
 #get some info
-     my ($user, $pwd, $db, $server) =@{$self}{qw/to_user to_password sx_to_database to_server/};
-     my ($from_server, $from_database) =@{$self}{qw/from_server sx_from_database/};
-     my ($tab) = keys %{ $self->{sx_to_info}->{$db} };
-     @{ $self->{sx_to_table_indices}->{_names} } = ();
+        my ( $user, $pwd, $db, $server ) = @{$self}{qw/to_user to_password sx_to_database to_server/};
+        my ( $from_server, $from_database ) = @{$self}{qw/from_server sx_from_database/};
+        my ($tab) = keys %{ $self->{sx_to_info}->{$db} };
+        @{ $self->{sx_to_table_indices}->{_names} } = ();
 
 #check option settings
-     my $dari = $self->{sx_drop_and_recreate_indices};
-     my %dari = %$dari;
+        my $dari = $self->{sx_drop_and_recreate_indices};
+        my %dari = %$dari;
 
 #rip thru the results of the sql depending if syts is specified
-     if($dari{syts}) {
-         my $src = $dari{source}; 
-         my $syts_drop_base = "syts -T$server.$db -U$user -P$pwd -a 'drop index' ";
-         my $syts_create_base = "syts -S$src -D$server.$db -U$user -P$pwd -a 'create index' ";
-         my $li = ();
-         for my $index (@idx) {
-             my ($ci, $di, $in) = @{$index}{qw/create_index drop_index idx_name/};
-             $li .= "$tab.$in,";
-             push @{ $self->{sx_to_table_indices}->{_names} }, $in;
-         } 
-         $li = substr($li,0,-1);
-         $self->{sx_to_table_indices}->{syts}->{create} = $syts_create_base . "-O'$li'";
-         $self->{sx_to_table_indices}->{syts}->{drop} = $syts_drop_base . "-O'$li'";
+        if ( $dari{syts} ) {
+            my $src              = $dari{source};
+            my $syts_drop_base   = "syts -T$server.$db -U$dari{sytsUser} -P$dari{sytsPwd} -a 'drop index' ";
+            my $syts_create_base = "syts -S$src -D$server.$db -U$dari{sytsUser} -P$dari{sytsPwd} -a 'create index' ";
+            my $li               = ();
 
-     } else {
-         for my $index (@idx) {
-             my ($ci, $di, $in) = @{$index}{qw/create_index drop_index idx_name/};
-             $self->{sx_to_table_indices}->{$in}->{create_sql} = $ci;
-             $self->{sx_to_table_indices}->{$in}->{drop_sql} = $di;
-             push @{ $self->{sx_to_table_indices}->{_names} }, $in;
-         }
-     }
-     
-     return 0;
-  }
+            for my $index (@idx) {
+                my ( $ci, $di, $in ) = @{$index}{qw/create_index drop_index idx_name/};
+                $li .= "$tab.$in,";
+                push @{ $self->{sx_to_table_indices}->{_names} }, $in;
+            }
+            $li = substr( $li, 0, -1 );
+            $self->{sx_to_table_indices}->{syts}->{create} = $syts_create_base . "-O'$li'";
+            $self->{sx_to_table_indices}->{syts}->{drop}   = $syts_drop_base . "-O'$li'";
+
+        }
+        else {
+            for my $index (@idx) {
+                my ( $ci, $di, $in ) = @{$index}{qw/create_index drop_index idx_name/};
+                $self->{sx_to_table_indices}->{$in}->{create_sql} = $ci;
+                $self->{sx_to_table_indices}->{$in}->{drop_sql}   = $di;
+                push @{ $self->{sx_to_table_indices}->{_names} }, $in;
+            }
+        }
+
+        return 0;
+    }
+
 
 #----
 #
 #----
-  sub sx_usage {
+    sub sx_usage {
 
-     my $self = shift;
+        my $self = shift;
 
 #if not called from sybxfer don't bother.
-     return 0 unless $self->{sybxfer};
+        return 0 unless $self->{sybxfer};
 
-     my $short_usage = <<EOF;
+        my $short_usage = <<EOF;
 $0 usage:
    --help, -h                        for this help
    perldoc Xfer.pm                   for the full doc
@@ -2592,7 +3218,8 @@ from and to login information
    --table, -T                       sets -from_table and to_table. Use 'db..table' syntax
 
 if using from_file
-   --from_file_delimiter, -ffd <regex>  eg '\s+' or '|'
+   --from_file_delimiter, -ffd <regex>           eg '\\s+' or '|'
+   --from_file_pack_format, -ffpf <pack string>  eg 'a2 x4 a23'
 
 more options
    --timeout,-to                     timeout value in seconds 
@@ -2605,7 +3232,11 @@ more options
    --echo                            echo sql commands that run under the covers
    --silent                          quiet mode
    --progress_log, -verbose          print a log for every -batchsize 
-   --debug                           programmer debug mode
+   --debug                           programmer debug mode. use with caution.
+   --set_identity_insert, -sii       use the identity values in the -source
+   --packetsize, -ps                 packet size value. overrides target server config value.
+   --textsize, -txs                  textsize value.  overrides target server config value.
+                                    
 
    --from_file_map, -ffm <string | hash ref | file>  
                                      map table columns to field positions
@@ -2638,183 +3269,381 @@ api only options
    --callback_print     coderef      code to call when printing to stdout
 EOF
 
-   warn $short_usage;
-   return 1;
-   }
+        warn $short_usage;
+        return 1;
+    }
 
 #-----
 #truncate table
 #-----
-   sub sx_truncate_table {
-
-      my $self = shift;
-      
-#special sql to use 'syts' to truncate table
-      my ($user, $pwd, $db, $server) =@{$self}{qw/to_user to_password sx_to_database to_server/};
-      my ($tab) = keys %{ $self->{sx_to_info}->{$db} };
-      sx_print($self, "   -truncate_flag option set, truncating target table\n") if($self->{progress_log});
-      my $tv = $self->{truncate_flag};
-      my (%trunc, $err) = ();
- 
-#reference
-      if(ref $tv eq 'HASH') {
-         %trunc = %$tv;
-#char list
-      } elsif( $tv =~ /^\s*\(/ ) {
-         %trunc = eval "$tv";
-         $@ && $err++;
-#maybe char ref
-      } elsif( $tv =~ /^\s*\{/ ) {
-         my $s = eval "$tv";
-         $@ && $err++;
-         %trunc = %$s;
-#sql truncate
-      } elsif($tv == 1) {
-         %trunc = (syts=>0);
-#error
-      } else {
-         $err++;
-      }
-
-#if logfile is not defined then make it stdout
-      if(!defined $trunc{logfile} ) {$trunc{logfile} = 'stdout'}
-      if($trunc{logfile} eq '0') {$trunc{logfile} = '/dev/null'}
-
-#check for errors
-      my @s = keys %trunc;
-      if($err || @s != 2 || !defined $trunc{syts} || !defined $trunc{logfile}) { 
-           sx_complain("couldn't understand -truncate_flag.\n" .
-                       "Use syntax: -truncate_flag [ '(syts=>1, logfile=>filename)' ] \n");
-           return 1; 
-      }
-
-      
-#truncate via syts
-      if($trunc{syts}) {
-         my $out = $trunc{logfile} eq 'stdout' ? '' : ">$trunc{logfile}";
-         my $syts_cmd = qq/syts -T$server.$db -U$user -P$pwd/;
-         my $ksh_string="$syts_cmd -a 'truncate table' -O '$tab' $out";
-         return sx_run_shell_cmd($ksh_string);
-
-#standard sql to truncate table
-      } else {
-        my $dbh_to_non_bcp =  $self->{sx_dbh_to_non_bcp};
-        my $sql_string = "truncate table $tab";
-        my @status = $dbh_to_non_bcp->nsql($sql_string,[]);
-        $DB_ERROR && sx_complain("$DB_ERROR\n") && return 1;
-        return 0;
-
-      }
-   }
-
-#-----
-#
-#-----
-   sub sx_delete_rows {
-
-       my $self = shift;
-
-       my ($dbh_to_non_bcp, $tab, $wc, $bs, $silent) =  @{$self}{qw/sx_dbh_to_non_bcp to_table where_clause batchsize silent/};
-       my ($log, $echo) =  @{$self}{qw/progress_log echo/};
-       my $del_line = "delete $tab";
-       $del_line .= " where $wc" if $wc;
-       my $sql_string = sx_delete_sql($del_line, $bs, $silent);
-       sx_print($self, "   -delete_flag option set, deleting rows from target table\n") if $log;
-       sx_print($self, "   $del_line (in a loop)\n") if $echo;
-       my @status = $dbh_to_non_bcp->nsql($sql_string,[]);
-       $DB_ERROR && sx_complain("$DB_ERROR\n") && return 1;
-
-       return 0;
-   }
-
-#-----
-#
-#-----
-   sub sx_drop_indices {
-
-       my $self = shift;
-
-#find the indices
-       sx_drop_indices_setup($self) && return 1;
-
-#log
-       my ($server, $tab, $log, $dbh_to_non_bcp) =@{$self}{qw/to_server to_table progress_log sx_dbh_to_non_bcp/};
-       my @idx_names = @{ $self->{sx_to_table_indices}->{_names} };
-       local $" = ',';  #so the array list separates with commas.
-       if(@idx_names) {
-          sx_print($self, "   -drop_and_recreate_indices option set, dropping indices (@idx_names) on target table\n") if $log;
-       } else {
-          sx_print($self, "   -drop_and_recreate_indices option set,  no indices to drop on target table\n") if $log;
-       }
-
-      my %dari = %{ $self->{sx_drop_and_recreate_indices} };
-
-#check if syts specified
-      if($dari{syts}) {
-          my $out = $dari{logfile} eq 'stdout' ? '' : ">$dari{logfile}";
-          my $ksh_cmd = $self->{sx_to_table_indices}->{syts}->{drop} . " $out";
-          return sx_run_shell_cmd($ksh_cmd);
-
-       } else {
-          my $drop_sql = '';
-          for my $in (@idx_names) {
-            $drop_sql .= $self->{sx_to_table_indices}->{$in}->{drop_sql} . "\n";
-          }
-          if($drop_sql) {
-             my @status = $dbh_to_non_bcp->nsql($drop_sql,[]);   
-             $DB_ERROR && sx_complain("$DB_ERROR\n") && return 1;
-          }
-       }
-       return 0;
-   }
-  
- 
-#----
-#
-#----
-   sub sx_create_indices {
+    sub sx_truncate_table {
 
         my $self = shift;
 
-        my @idx_names =  @{ $self->{sx_to_table_indices}->{_names} };
-        if ($self->{progress_log}) {
-            sx_print($self, "\n");
-            sx_print($self, "Post xfer processing\n");
-            local $" = ',';  #so the array list separates with commas.
-            sx_print($self, "   -drop_and_recreate_indices option set, creating indices (@idx_names) on target table\n");
+#special sql to use 'syts' to truncate table
+        my ( $user, $pwd, $db, $server ) = @{$self}{qw/to_user to_password sx_to_database to_server/};
+        my ($tab) = keys %{ $self->{sx_to_info}->{$db} };
+        $self->_print("   -truncate_flag option set, truncating target table\n") if ( $self->{progress_log} );
+        my $tv = $self->{truncate_flag};
+
+        my ( %trunc, $err, $hp ) = ();
+        if ( $tv && $tv =~ /^.$/ ) {
+            %trunc = ( syts => 0 );
+        }
+        else {
+            ( $hp, $err ) = sx_parse_user_hash($tv);
+            %trunc = %$hp if ref($hp) eq "HASH";
+        }
+
+#check if necessary.
+        sx_check_target( $self, 'truncate' ) || return 0;
+
+#some defaults
+        $trunc{logfile} = '/dev/null' if $trunc{logfile} eq '0';
+        $trunc{logfile} = 'stdout' unless defined $trunc{logfile};
+        $trunc{sytsUser} = $user unless defined $trunc{sytsUser};
+        $trunc{sytsPwd} = $trunc{sytsUser} unless defined $trunc{sytsPwd};
+
+#check for errors
+        my @s = keys %trunc;
+        if ( $err || @s != 4 || !defined $trunc{syts} || !defined $trunc{logfile} ) {
+            sx_complain( "couldn't understand -truncate_flag.\n"
+                . "Use syntax: -truncate_flag [ '(syts=>1, logfile=>filename), sytsUser=>User, sytsPwd=>Pwd' ] \n" );
+            return 1;
+        }
+
+#truncate via syts
+        if ( $trunc{syts} ) {
+            my $out = $trunc{logfile} eq 'stdout' ? '' : ">$trunc{logfile}";
+            my $syts_cmd   = qq/syts -T$server.$db -U$trunc{sytsUser} -P$trunc{sytsPwd}/;
+            my $ksh_string = "$syts_cmd -a 'truncate table' -O '$tab' $out";
+            return sx_run_shell_cmd($ksh_string);
+
+#standard sql to truncate table
+        }
+        else {
+            my $dbh_to     = $self->{sx_dbh_to_non_bcp};
+            my $sql_string = "truncate table $tab";
+            my @status     = @{ $self->_runsql( $dbh_to, $sql_string, [], undef ) };
+
+#!            my @status = $dbh_to_non_bcp->func($sql_string,  [], undef, 'nsql' );
+            $DB_ERROR && sx_complain("$DB_ERROR\n") && return 1;
+            return 0;
+
+        }
+    }
+
+#----
+#
+#----
+    sub sx_check_target {
+
+        my $self  = shift;
+        my $which = shift;
+
+        my $dbh_to  = $self->{sx_dbh_to_non_bcp};
+        my $zerosql = "select cnt=count(*) from $self->{to_table}";
+        my @res     = @{ $self->_runsql( $dbh_to, $zerosql, {}, undef ) };
+
+#!        my @res = $self->{sx_dbh_to_non_bcp}->func($zerosql,  {}, undef, 'nsql' );
+        $DB_ERROR && sx_complain("unable to get count on target table\n$DB_ERROR\n") && return 1;
+        my $numrows = $res[0]->{cnt};
+        if ( $numrows > 0 ) {
+            return 1;
+        }
+        else {
+            $self->_print("   target table empty. skipping $which.\n") if $self->{progress_log};
+            return 0;
+        }
+    }
+
+#-----------------------------------------------------------------------
+#parse the --from_source value
+#-----------------------------------------------------------------------
+    sub _parse_from_source {
+
+        my ( $self, $opt ) = @_;
+
+#examples
+#
+#--from_source  \
+#
+#    {source => dbd:Sybase:<server>:<user>:<pwd>,  from => table=<tablename>, whereClause => wc, holdlock => 0/1 }
+#    {source => dbd:Sybase:<server>:<user>:<pwd>,  from => sql=<sql> }
+#    {source => dbd:Sybase:<server>:<user>:<pwd>,  from => file=<filename> }
+#
+#    {source => dbd:DB2:<server>:<user>:<pwd>,  from => table=<tablename>, whereClause => wc, holdlock => 0/1 }
+#    {source => dbd:DB2:<server>:<user>:<pwd>,  from => sql=<sql> }
+#    {source => dbd:DB2:<server>:<user>:<pwd>,  from => file=<filename> }
+# 
+#    {source => Perl, from => \&code  }
+#    {source => Perl, from => \*fh }
+#    {source => Perl, from => \@array }
+# 
+#    {source => File, from => xxx.bcp }
+#
+#
+#
+#returns a dsn like string
+#
+#     dbd.Sybase.<server>.<table>
+#     dbd.Sybase.<server>.SQL.inline
+#     dbd.Sybase.<server>.SQL.inFile.$fn
+#     dbd.DB2.<server>.<table>
+#     dbd.DB2.<server>.SQL.inline
+#     dbd.DB2.<server>.SQL.inFile.$fn
+#     Perl.CodeRef.<ref>
+#     Perl.FHRef.<ref>
+#     Perl.ArrayRef.<ref>
+#     File.Name.<$fn>
+#     Sql.Inline.<$sql>
+#     Sql.File.Name.<$fn>
+
+#parse the value. verify options has already verified no parsing error
+        my $dsn = ();
+        if ( $opt->{from_source} ) {
+            my ( $fs, $err ) = sx_parse_user_hash( $opt->{from_source}, '-from_source' );
+
+#look for key 'source'
+            my $pref = "err: --from_source.";
+            sx_complain("unable to parse --from_source. see documentation.") && return 1 if $err;
+            sx_complain("$pref 'source' must be specified")                  && return 1 if !$fs->{source};
+            sx_complain("$pref 'source' value error. Only dbd,  Perl, and File are supported.") && return 1
+              if $fs->{source} !~ /^(dbd|Perl|File)/;
+
+#key source =~ ^dbd
+            my @s = ();
+
+#DBD
+            if ( $fs->{source} =~ /^dbd/i ) {
+
+                my (@s) = split /[:=]/, $fs->{source};
+
+#key from
+                my ( $from, $fromValue ) = $fs->{from} =~ /(t|s|f)(?:\w*)[:=](.*)/i;
+                $from = lc $from;
+                if ( $fromValue =~ s/^\s*['"]// ) { $fromValue =~ s/['"]\s*$//; }
+                my (@f) = split /[:=]/, $fromValue;
+
+#backward compatiblity
+                $opt->{from_server}     = $s[2];
+                $opt->{from_user}       = $s[3];
+                $opt->{from_password}   = $s[4];
+                $opt->{from_scriptName} = $s[5];
+
+                if ( $from eq 't' ) {
+                    $opt->{from_table} = $fromValue;
+                    $dsn = "$s[0].$s[1].$s[2].sql.table=$fromValue";
+                }
+                elsif ( $from eq 's' ) {
+                    $opt->{from_sql} = $fromValue;
+                    $dsn = "$s[0].$s[1].$s[2].sql.inline=<not echoed>";
+                }
+                elsif ( $from eq 'f' ) {
+                    $opt->{from_script} = $fromValue;
+                    $dsn = "$s[0].$s[1].$s[2].sql.inFile=$fromValue";
+                }
+
+#PERL
+            }
+            elsif ( $fs->{source} =~ /^Perl/i ) {
+                $opt->{from_perl} = $fs->{from};    #arrayRef or codeRef
+                if ( ref $fs->{from} eq 'CODE' ) {
+                    $dsn = "Perl.CodeRef.$fs->{from}";
+                }
+                elsif ( ref $fs->{from} eq 'ARRAY' ) {
+                    $dsn = "Perl.ArrayRef.$fs->{from}";
+                }
+                elsif ( ref $fs->{from} eq 'GLOB' ) {
+                    $dsn = "Perl.FHRef.$fs->{from}";
+                    $opt->{from_file} = $opt->{from_perl};
+                    delete $opt->{from_perl};
+                }
+                else {
+                    sx_complain(
+                        "When -source is 'Perl', -from can only be codeRef, ArrayRef or FHref. bad value=<$fs->{source}>");
+                }
+
+#FILE
+            }
+            elsif ( $fs->{source} =~ /^File/i ) {
+                $opt->{from_file} = $fs->{source};
+                $dsn = "Perl.File.$opt->{from_file}";
+                if ( ref $opt->{from_file} eq 'GLOB' ) {
+                    $opt->{from_perl} = $opt->{from_file};
+                    delete $opt->{from_file};
+                    $dsn = "Perl.CodeRef.$opt->{from_perl}";
+                }
+            }
+            return ( 0, $dsn );
+
+#---
+#backward compatibility. these options used with Sybase::Xfer
+#---
+        }
+        elsif ( ref( $opt->{from_perl} ) eq 'CODE' ) {
+            $dsn = "Perl.CodeRef.$opt->{from_perl}";
+            return ( 0, $dsn );
+        }
+        elsif ( ref( $opt->{from_perl} ) eq 'ARRAY' ) {
+            $dsn = "Perl.ArrayRef.$opt->{from_perl}";
+            return ( 0, $dsn );
+        }
+        elsif ( $opt->{from_table} ) {
+            $dsn = "dbd.Sybase.$opt->{from_server}.$opt->{from_table}";
+            return ( 0, $dsn );
+        }
+        elsif ( $opt->{from_file} ) {
+            $dsn = "File.Name.$opt->{from_file}";
+            return ( 0, $dsn );
+
+        }
+        elsif ( $opt->{from_sql} ) {
+            $dsn = "dbd.Sybase.$opt->{from_server}.sql.inline=<not echoed>";
+            return ( 0, $dsn );
+
+        }
+        elsif ( $opt->{from_script} ) {
+            $dsn = "dbd.Sybase.$opt->{from_server}.sql.inFile=$opt->{from_script}";
+            return ( 0, $dsn );
+
+        }
+        return ( 0, undef );
+
+    }
+
+#-----
+#
+#-----
+    sub sx_delete_rows {
+
+        my $self = shift;
+
+        my ( $dbh_to, $tab, $wc, $bs, $silent ) = @{$self}{qw/sx_dbh_to_non_bcp to_table where_clause batchsize silent/};
+        my ( $log, $echo ) = @{$self}{qw/progress_log echo/};
+        my $del_line = "delete $tab";
+        $del_line .= " where $wc" if $wc;
+
+        my $sql_string = sx_delete_sql( $del_line, $bs, $silent );
+        $self->_print("   -delete_flag option set, deleting rows from target table\n") if $log;
+        $self->_print("   $del_line (in a loop)\n") if $echo;
+
+#check if any rows in target;
+        sx_check_target( $self, "delete" ) || return 0;
+
+        my $a = $Sybase::CTlib::nsql_deadlock_retrycount;
+        my $b = $Sybase::CTlib::nsql_deadlock_retrysleep;
+        my $c = $Sybase::CTlib::nsql_deadlock_verbose;
+
+        $Sybase::CTlib::nsql_deadlock_retrycount = 100;
+        $Sybase::CTlib::nsql_deadlock_retrysleep = 60;
+        $Sybase::CTlib::nsql_deadlock_verbose    = 1;
+
+        my @status = @{ $self->_runsql( $dbh_to, $sql_string, [], undef ) };
+
+#        my @status = $dbh_to_non_bcp->func($sql_string,  [], undef, 'nsql' );
+        $DB_ERROR && sx_complain("$DB_ERROR\n") && return 1;
+
+        $Sybase::CTlib::nsql_deadlock_retrycount = $a;
+        $Sybase::CTlib::nsql_deadlock_retrysleep = $b;
+        $Sybase::CTlib::nsql_deadlock_verbose    = $c;
+
+        return 0;
+    }
+
+#-----
+#
+#-----
+    sub _drop_indices {
+
+        my $self = shift;
+
+#find the indices
+        my $dbh = $self->{sx_dbh_to_non_bcp};
+        my $db = $self->{sx_to_database};
+        my $tab = $self->{sx_to_table};
+        $self->_drop_indices_setup($dbh, $db, $tab) && return 1;
+
+#log
+        my ( $server, $tab, $log, $dbh_to ) = @{$self}{qw/to_server to_table progress_log sx_dbh_to_non_bcp/};
+        my @idx_names = @{ $self->{sx_to_table_indices}->{_names} };
+        local $" = ',';    #so the array list separates with commas.
+        if (@idx_names) {
+            $self->_print("   -drop_and_recreate_indices option set, dropping indices (@idx_names) on target table\n")
+              if $log;
+        }
+        else {
+            $self->_print("   -drop_and_recreate_indices option set,  no indices to drop on target table\n") if $log;
+        }
+
+        my %dari = %{ $self->{sx_drop_and_recreate_indices} };
+
+#check if syts specified
+        if ( $dari{syts} ) {
+            my $out = $dari{logfile} eq 'stdout' ? '' : ">$dari{logfile}";
+            my $ksh_cmd = $self->{sx_to_table_indices}->{syts}->{drop} . " $out";
+            return sx_run_shell_cmd($ksh_cmd);
+
+        }
+        else {
+            my $drop_sql = '';
+            for my $in (@idx_names) {
+                $drop_sql .= $self->{sx_to_table_indices}->{$in}->{drop_sql} . "\n";
+            }
+
+            if ($drop_sql) {
+                $self->_runsql( $dbh_to, $drop_sql, undef, undef );
+                $DB_ERROR && sx_complain("$DB_ERROR\n") && return 1;
+            }
+        }
+        return 0;
+    }
+
+#----
+#
+#----
+    sub _create_indices {
+
+        my $self = shift;
+
+        my @idx_names = @{ $self->{sx_to_table_indices}->{_names} };
+        if ( $self->{progress_log} ) {
+            $self->_print("\n");
+            $self->_print("Post xfer processing\n");
+            local $" = ',';    #so the array list separates with commas.
+            $self->_print("   -drop_and_recreate_indices option set, creating indices (@idx_names) on target table\n");
         }
 
 #this was setup in drop_indices
-        my %dari = %{  $self->{sx_drop_and_recreate_indices} };
+        my %dari = %{ $self->{sx_drop_and_recreate_indices} };
 
 #syts
-        if($dari{syts}) {
-           my $out = $dari{logfile} eq 'stdout' ? '' : ">>$dari{logfile}";
-           my $ksh_cmd = $self->{sx_to_table_indices}->{syts}->{create} . " $out";
-           return sx_run_shell_cmd($ksh_cmd);
+        if ( $dari{syts} ) {
+            my $out = $dari{logfile} eq 'stdout' ? '' : ">>$dari{logfile}";
+            my $ksh_cmd = $self->{sx_to_table_indices}->{syts}->{create} . " $out";
+            return sx_run_shell_cmd($ksh_cmd);
+
 #not syts
-        } else {
-           my $dbh_to_non_bcp =  $self->{sx_dbh_to_non_bcp};
-           for my $in (@idx_names) {
-              my $sql = $self->{sx_to_table_indices}->{$in}->{create_sql};
-              sx_print($self, "   creating index $in : $sql\n") if $self->{progress_log};
-              $dbh_to_non_bcp->nsql("$sql");
-              $DB_ERROR && sx_complain("Create Index error:\n$DB_ERROR\n") && return 1;
-           }
+        }
+        else {
+            my $dbh_to = $self->{sx_dbh_to_non_bcp};
+            for my $in (@idx_names) {
+                my $sql = $self->{sx_to_table_indices}->{$in}->{create_sql};
+                $self->_print("   creating index $in : $sql\n") if $self->{progress_log};
+                $self->_runsql( $dbh_to, $sql, undef, undef );
+                $DB_ERROR && sx_complain("Create Index error:\n$DB_ERROR\n") && return 1;
+            }
         }
 
         return 0;
-   }
-
+    }
 
 #------
 #run a shell script
 #------
-   sub sx_run_shell_cmd {
-
-       return system(+shift);
-   }
-
+    sub sx_run_shell_cmd {
+        return system( +shift );
+    }
 
 #================================================================
 #================================================================
@@ -2844,10 +3673,9 @@ __END__
 
 =head1 DEPENDENCIES
 
- requires at least perl version 5.005
+ requires at least perl version 5.6
 
- Sybase::DBlib 
- Sybase::ObjectInfo (this comes packaged with Sybase::Xfer)
+ Sybase::CTlib 
 
 =head1 QUICK DESCRIPTION
 
@@ -3005,8 +3833,8 @@ See discussion in next section about return value settings.
 The -auto_delete switch is a way to indicate to *only* delete  the  rows
 you're about to insert. Sometimes  the  -delete_flag  and  -where_clause
 combination won't work - they cut too  wide  a  swath.  This  option  is
-typically used to manually replicate a  table.  -to_table  must  have  a
-unique index for this option to work.
+typically used to manually replicate a  table or to append to a table.  
+-to_table  must  have  a unique index for this option to work.
 
 =head1 RETURN VALUES
 
@@ -3098,13 +3926,14 @@ string is the sql to run against the I<from> server
 
 string is the filename containing sql to run
 
-=item -from_perl (coderef)
+=item -from_perl (coderef | arrayref)
 
-coderef is perl sub to call to get data
+coderef is perl sub to call to get data. arrayref is an array of arrayrefs.
 
 =item -from_file | -ff (filename)
 
-name of file to read data from.
+name of file to read data from. can be reference to a fileHandle or if filename
+ends in .gz or .zip it'll zcat the file first.
 
 =back
 
@@ -3172,9 +4001,9 @@ bcp batch size. Default=1000
 
 append I<string> when using -from_table to sql select statement
 
-=item -truncate_flag | -tf [syts]
+=item -truncate_flag | -tf [ 1 | string ]
 
-truncate to_table. If set to I<syts> then it'll  use  a  Morgan  Stanley
+truncate to_table. If 'string'  then it'll  use  a  Morgan  Stanley
 only command to modify the meta data of a production database.
 
 =item -delete_flag | -df
@@ -3193,9 +4022,13 @@ adds I<holdlock> after the I<from_table>
 
 strips trailing whitespace
 
-=item -from_file_delimiter | -ffd (delimiter)
+=item -from_file_delimiter | -ffd "delimiter | regexp"
 
 the delimiter used to separate fields. Used in conjunction with -from_file only.
+
+=item -from_file_pack_format | -ffpf "pack format"
+
+the 'pack' format to send to perl's unpack function to determine the fields 
 
 =item -from_file_map | -ffm (hashref or string or file)
 
@@ -3206,11 +4039,70 @@ First position begins at 0 (not one.) Ignored if source is -from_perl.
 
 timeout value in seconds before the transfer is aborted. Default is 0. No timeout.
 
-=item -drop_and_recreate_indices | dari [ < string | hash ref | filename > ]
+=item -drop_and_recreate_indices | -dari [ < string | hash ref | filename > ]
 
 drop all the indices on -to_table before the transfer begins and recreate all the
 indices after the transfer is complete. DO NOT specify a value unless you wish to
 use MorganStanley's I<syts> application.
+
+=item -set_identity_insert | -sii (column)
+                                                                                          
+this switch should be used if the target table has  an  identity  column
+and you want the values xferred from the source. The default is to  have
+the server set new values. The first column starts at 1 (not zero.)
+
+=item -packetsize | -ps (value)
+
+I defer to sybase's documentation at 
+https://login.sybase.com/detail/1,6904,954,00.html
+
+Increase the packet size for  the  connection  On  most  platforms,  the
+packet size defaults to 512 bytes. This default is provided for backward
+compatibility. Larger packet sizes  2048  to  4096  bytes,  for  example
+almost always yield better  performance.  This  is  generally  true  for
+applications that fetch rows with  large  columns,  rows  with  lots  of
+columns, or lots of rows with a few small columns. It is especially true
+for applications that do bulk copy data transfers or  that  handle  text
+and image data.
+
+To increase a connection's packet size, set the CS_PACKETSIZE connection
+property, via ct_con_props, prior to opening the  connection.  [this  is
+what happens when you use this switch]
+
+
+Note. You may have to reconfigure SQL Server to accept a larger  maximum
+network packet size. See the SQL Server System Administration Guide  for
+instructions on reconfiguring the maximum network packet size.
+
+The following  trade-offs  come  into  play  when  the  packet  size  is
+increased:
+
+Increasing the packet size will increase the amount of  memory  required
+by the client and the server. Any network will impose a  restriction  on
+the maximum size of transmitted packets. On most networks, this  is  4K.
+If the TDS packet size  is  larger  than  the  maximum  allowed  by  the
+underlying network, then each TDS packet will actually be transmitted as
+one  or  more  physical  network  packets.  This  can  adversely  affect
+performance.
+
+
+
+=item -textsize | -txs (value)
+
+From the Sybase's Open Client-Library/C Reference Manual (online version),
+chapter 2, Options:
+
+specifies the value of the Adaptive Server global  variable  @@textsize,
+which limits the size of text  or  image  values  that  Adaptive  Server
+returns.
+
+When setting this option, supply a parameter that specifies  length,  in
+bytes, of the longest text or image value that  Adaptive  Server  should
+return.
+
+The default server configuration seems to be 32k. So if youre text/images
+are larger than this you'll need to set this value.
+
 
 
 =back
@@ -3306,32 +4198,48 @@ programmer debug mode
 
  -from_table | -ft  <table_name>
 
-from table name. Use a fully qualified path to be safe. For example,  pubs..titles. This removes the dependency on the default
-database for the -from_user value.
+from table name. Use a fully qualified path to  be  safe.  For  example,
+pubs..titles. This removes the dependency on the  default  database  for
+the -from_user value.
 
  -from_sql  <string>
 
-send sql in <string> to -from_server and xfer results to -to_table.  For example, 'select author_id, lname from pubs..authors'
-This implies the -to_table has two columns of compatible type to store author_id and lname in it.
+send sql in <string> to -from_server and xfer results to -to_table.  For
+example, 'select author_id, lname from pubs..authors' This  implies  the
+-to_table has two columns of compatible  type  to  store  author_id  and
+lname in it.
 
  -from_script <file> 
 
-send sql in <file> to from_server and xfer results to to_table.  Essentially the same as -from_sql except that it opens
-a file and gets the sql from there.
+send sql  in  <file>  to  from_server  and  xfer  results  to  to_table.
+Essentially the same as -from_sql except that it opens a file  and  gets
+the sql from there.
 
- -from_perl <code-ref> 
+ -from_perl <code-ref | array-ref> 
 
-call code reference repetitively for data. Call the code-ref for data to send to -to_table.  
-user routine must return the following array: ($status, $array_ref)  where $status is true to call it again or false to 
-end the transfer. $arrary_ref is an array refernce to the row to send. This switch is only available from the API for
-obvious reasons.
+if code-ref then call repetitively for data to  transfer  to  -to_table.
+code-ref must return the following array:  ($status,  $array_ref)  where
+$status less than 0 to skip, equal 0 to end the  transfer,  and  greater
+than 0 to continue. $arrary_ref is an array reference to the row to send.
+
+if array-ref then ref contains array-refs to transfer each sub array-ref
+being one row.
+
+This switch is only available from the API. --from_file_map is ignored
+when this switch is used.
 
  -from_file <file>
 
-the file to read the actual data from. It must be a delimited file. Using this option it behaves simliar
-to Sybase::BCP (in) and Sybase's own bcp. I've attempted to make the error handling richer. See switches
--from_file_delimiter and -from_file_map also.
-
+the file to read the actual data from. It can be a delimited file  or  a
+fixed-field  file.  When  using  this  option  it  behaves  simliar   to
+Sybase::BCP (in) and Sybase's own bcp. I've attempted to make the  error
+handling  richer.  See  switches  -from_file_delimiter  (for   delimited
+files),   -from_file_pack_format   (for   fixed   format   files)    and
+-from_file_map (for changing the ordering). It can be a compressed  file
+(.gz or .zip)  or  a  reference  that  is  sub-classed  from  "IO::File"
+(usually a FileHandle but not always.) If you want to to get  fancy,  it
+can be anything that is valid in perl's own 'open' statement such  as  a
+named pipe. eg. "cut -d: -f1,5 /etc/passwd |"
 
 =head2 from information
 
@@ -3419,21 +4327,32 @@ bcp batch size into the to_table. Default=1000.
 
  -where_clause | -wc <where_clause>
 
-send 'select * from I<from_table> where I<where_clause>' to the I<from_server>. The 
-default is to use no where clause thereby just sending 'select * from I<from_table>'.
-This is only used when the I<from_source> is a table.  Also see -delete_flag.
+send  'select  *  from  I<from_table>  where  I<where_clause>'  to   the
+I<from_server> when -from_table is a specified (otherwise this switch is
+only used by the -delete_flag.) The default is to use  no  where  clause
+thereby just sending 'select * from I<from_table>'. 
+Also see -delete_flag switch.
 
- -truncate_flag | -tf  [syts]
+ -truncate_flag | -tf  < 1 | user_string >
 
 send  'truncate  table  I<to_table>'  to  the  I<to_server>  before  the
 transfer begins. This requires dbo privilege,  remember.  If  you  don't
 have dbo privilege and you want to remove all the rows from  the  target
 table you have two options. Use the -delete_flag with  no  -where_clause
 or truncate the table via an alternate method  (eg.  under  a  different
-user name) before you run the transfer. Default  is  false.  If  set  to
-I<syts>, it'll use I<syts>, Morgan Stanley only command, to allow one to
-use no-logged operations on a production database. This cirmcumvents dbo
-privilege but does require other privileges.
+user name) before you run the transfer. Default  is  false.  
+
+If user_string is specified, a hook into MorganStanley syts command can
+be used.  user_string is specified as such:
+ 
+   '{syts=>1, logfile=>file, sytsUser=>user, sytsPwd=>pwd}' 
+
+   or a perl hash pointer to the above.
+
+<file> defaults  to  stdout,  <user>  defaults  to  -to_user  and  <pwd>
+defaults to <user>. Using 'user_string' cirmcumvents dbo  privilege  but
+does require other syts privilege.
+
 
  -delete_flag | -df     
 
@@ -3459,16 +4378,23 @@ transfer is taking place. The default is noholdlock.
 
  -trim_whitespace | tw
 
-Will set B<nsql>'s $Sybase::DBlib::nsql_strip_whitespace to  true  which
+Will set B<nsql>'s $Sybase::CTlib::nsql_strip_whitespace to  true  which
 trims trailing whitespace before bcp'ing the data into target table.  If
 a field is all whitepace  on  the  I<from>  table  then  the  result  of
 trimming whitespace will be null. Therefore, the corresponding column on
 the I<to> table needs to permit nulls. Default is false.
 
- -from_file_delimiter <regex>
+ -from_file_delimiter | -ffd <regex>
 
 the delimiter to use to split  each  record  in  -from_file.  Can  be  a
-regular expression. This switch is only valid with -from_file.
+regular expression. This switch is only valid with -from_file. Mutually
+exclusive with -from_file_pack_format.
+
+ -from_file_pack_format | -ffpf <pack format>
+
+the pack format to apply (using unpack) to each input line. This  switch
+is   only   valid   with    -from_file.    Mutually    exclusive    with
+-from_file_delimeter.
 
 
  -from_file_map | -ffm <string, hashref or file)
@@ -3513,7 +4439,7 @@ one of the following:
 
 =item string
 
-"(syts=>1, source=>'server.database', logfile=>'file')"
+"(syts=>1, source=>'server.database', logfile=>'file', withSortedData=>0/1)"
 where server.database is the location of the -to_table with the indices 
 to create (typically on a test server.) if no logfile is 
 specified then syts output goes to stdout.
@@ -3530,27 +4456,33 @@ is the same as above only in a file
 
 =head2 auto delete
 
-The -auto_delete switch indicates that it should be ensured that any rows selected from 
-the I<from_table> first be removed from the I<to_table>. This differs from the 
--delete_flag and -where_clause combination that makes sweeping deletes. -auto_delete was
-added for the sole purpose of keeping the -to_table up-to-date by transferring 
-only 'changed' records from the -from_table and not knowing just which records 
-changed apriori. 
+The -auto_delete switch indicates that it should  be  ensured  that  any
+rows  selected  from  the  I<from_table>  first  be  removed  from   the
+I<to_table>.  This  differs  from  the  -delete_flag  and  -where_clause
+combination that makes sweeping deletes. -auto_delete was added for  the
+sole purpose of keeping the -to_table up-to-date  by  transferring  only
+'changed' records from  the  -from_table  and  not  knowing  just  which
+records changed apriori.
+
+This switch presently only works with -from_table.
 
  -auto_delete [c1,c2...]
 
-c1, c2, ... are the B<unique key column names> into I<to_table>. When this switch is in 
-effect the module will create a table in -scratch_db named sybxfer$$, $$ being the current 
-process number, with the columns c1, c2, ...  Then it will bcp only those columns to
-this temp table. After that bcp is complete it will perform a delete (in a loop of the 
--auto_delete_batchsize) via a join by these columns in the temp table to the 
-I<to_table> so as to remove the rows, if any. After the delete is complete the temp
-table is dropped and all the columns specified will be bcp'ed to the I<to_table>.
+c1, c2, ... are the B<unique key column names>  into  I<to_table>.  When
+this switch is in effect the module will create a table  in  -scratch_db
+named sybxfer$$, $$ being the current process number, with  the  columns
+c1, c2, ... Then it will bcp only those  columns  to  this  temp  table.
+After that bcp is complete it will perform a delete (in a  loop  of  the
+-auto_delete_batchsize) via a join by these columns in the temp table to
+the I<to_table> so as to remove the rows, if any. After  the  delete  is
+complete the temp table is dropped and all the columns specified will be
+bcp'ed to the I<to_table>.
 
-In essence, a simplisitic view is that the following is effectively done. 
-'delete I<to_table> where c1='cval1' and c2='cval2' ...' for every row in 
-the I<from_table> for values c1, c2, ... I mention this only in this way because 
-the explanation above seems either too convoluted (or I can't explain it clearly enough.)
+In essence, a simplisitic view is  that  the  following  is  effectively
+done. 'delete I<to_table> where c1='cval1' and c2='cval2' ...' for every
+row in the I<from_table> for values c1, c2, ... I mention this  only  in
+this way because the explanation above seems either too convoluted (or I
+can't explain it clearly enough.)
 
 
  -auto_delete_batchsize | adb [i]
@@ -3761,7 +4693,8 @@ print progess message on every bcp_sendbatch. Default is true.
  -debug                  
 
 programmer debug mode. Default is false.
- 
+  0x01 = various debug messages 
+  0x02 = print data in vertical mode before it's sent (and before map)
 
 
 
@@ -3966,7 +4899,7 @@ ISO versions of the Sybase server.
 
 =item *
 
-Allow DBlib handle to be passed in lieu of from_user/from_pwd/from_server
+Allow CTlib handle to be passed in lieu of from_user/from_pwd/from_server
 
 =item *
 
@@ -4027,7 +4960,7 @@ stephen.sprague@msdw.com
 =item Michael Peppler's homepage
 
 http://www.mbay.net/~mpeppler/
-for all things perl and Sybase including Sybase::DBLib, Sybase::BCP and a 
+for all things perl and Sybase including Sybase::CTLib, Sybase::BCP and a 
 ton other goodies. Definitely a must see. 
 
 =item Sybperl mail-list
@@ -4049,6 +4982,8 @@ Sybase::Xfer idea inspired by Mikhail Kopchenov.
 
 =head1 VERSION
 
+Version 0.52, 10-SEP-2001
+Version 0.51, 15-JUN-2001
 Version 0.41, 15-APR-2001
 Version 0.40, 01-MAR-2001
 Version 0.31, 12-FEB-2001
@@ -4056,5 +4991,8 @@ Version 0.30, 10-FEB-2001
 Version 0.20, 12-DEC-2000
 
 =cut
+
+
+
 
 1;
