@@ -1,4 +1,4 @@
-# $Id: Xfer.pm,v 1.21 2001/02/11 21:52:50 spragues Exp $
+# $Id: Xfer.pm,v 1.23 2001/02/13 02:44:43 spragues Exp spragues $
 #
 # (c) 1999, 2000 Morgan Stanley Dean Witter and Co.
 # See ..../src/LICENSE for terms of distribution.
@@ -65,13 +65,13 @@ package Sybase::Xfer;
    use Exporter;
    use Carp;
    use vars qw/@ISA @EXPORT @EXPORT_OK %EXPORT_TAGS $VERSION/;
-   $VERSION = 0.30;
+   $VERSION = 0.31;
    @ISA = qw/Exporter/;
 
  
 #RCS/CVS Version
    my($RCSVERSION) = do {
-     my @r = (q$Revision: 1.21 $ =~ /\d+/g); sprintf "%d."."%02d" x $#r, @r
+     my @r = (q$Revision: 1.23 $ =~ /\d+/g); sprintf "%d."."%02d" x $#r, @r
    };
 
  
@@ -1202,7 +1202,7 @@ EOF
       my %opt = sx_verify_options(@user_options);
 
 #if help, then give usage and bail
-      sx_usage(), exit 1 if(defined $opt{help} || !@ARGV);
+      sx_usage(), exit 1 if(defined $opt{help} || !$opt{to_table} );
       
 
 #if "U" specified, then make from and to equal to "user"
@@ -2465,8 +2465,9 @@ Sybase::Xfer idea inspired by Mikhail Kopchenov.
 
 =head1 VERSION
 
-Version 0.20, 12-DEC-2000
+Version 0.31, 12-FEB-2000
 Version 0.30, 10-FEB-2000
+Version 0.20, 12-DEC-2000
 
 =cut
 

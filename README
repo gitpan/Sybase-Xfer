@@ -2,9 +2,9 @@
 QUICK DESCRIPTION
   Sybase::Xfer transfers data between two Sybase servers  with  multiple
   options like specifying a where_clause, a smart auto_delete option and
-  can pump data from a perl or take  a  plain  flat  file.  Has  option,
+  can pump data from a perl sub or take a plain flat file.  Has  option,
   similiar to default behaviour in Sybase::BCP, to capture  failed  rows
-  in a batch. 
+  in a batch.
    
   Also comes with a command line wrapper, sybxfer.
         
@@ -89,6 +89,14 @@ CONTACTS
 
 
 CHANGE LOG:
+------------------------
+Version .31  12-feb-2001
+------------------------
+* Fixed sloppy bug left in v.30 where if @ARGV is empty it'd  print  a
+  usage statment. Duh! That  holds  for  the  script  sybxfer  but  it
+  doesn't hold user written scripts.
+
+
 ------------------------
 Version .30  11-feb-2001
 ------------------------
