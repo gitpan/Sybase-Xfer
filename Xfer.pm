@@ -1,4 +1,4 @@
-# $Id: Xfer.pm,v 1.19 2000/11/18 13:56:12 spragues Exp $
+# $Id: Xfer.pm,v 1.21 2001/02/11 21:52:50 spragues Exp $
 #
 # (c) 1999, 2000 Morgan Stanley Dean Witter and Co.
 # See ..../src/LICENSE for terms of distribution.
@@ -14,8 +14,14 @@
 #   sub xfer
 #   sub done 
 #
+#if -error_handling set to 'retry' and -callback_err_batch undefined
+#then this routine becomes the bcp_batch error_handler
+#
+#   sub bcp_batch_error_handler {
+#
 #private:
 #   sub sx_grab_from_sybase {
+#   sub sx_grab_from_file {
 #   sub sx_grab_from_perl {
 #   sub sx_cleanup {
 #
@@ -23,6 +29,8 @@
 #   sub sx_sendrow_bcp {
 #   sub sx_sendrow_failure {
 #   sub sx_sendrow_batch {
+#   sub sx_sendrow_batch_of_size {
+#   sub sx_sendrow_batch_success {
 #   sub sx_sendrow_return {
 #   sub sx_sendrow_temp {
 #
@@ -57,18 +65,19 @@ package Sybase::Xfer;
    use Exporter;
    use Carp;
    use vars qw/@ISA @EXPORT @EXPORT_OK %EXPORT_TAGS $VERSION/;
-   $VERSION = 0.1;
+   $VERSION = 0.30;
    @ISA = qw/Exporter/;
 
  
 #RCS/CVS Version
    my($RCSVERSION) = do {
-     my @r = (q$Revision: 1.19 $ =~ /\d+/g); sprintf "%d."."%02d" x $#r, @r
+     my @r = (q$Revision: 1.21 $ =~ /\d+/g); sprintf "%d."."%02d" x $#r, @r
    };
 
  
    
 #modules
+   use FileHandle;
    use File::Basename;
    use Sybase::DBlib;
    use Sybase::ObjectInfo;
@@ -77,7 +86,7 @@ package Sybase::Xfer;
 
 
 #globals
-  use vars qw/$DB_ERROR %opt/;
+  use vars qw/$DB_ERROR %opt $DB_ERROR_ONELINE/;
 
 
 
@@ -164,8 +173,13 @@ package Sybase::Xfer;
 #pick the source
      if(ref($self->{sx_sql_source}) eq "CODE") {
         sx_grab_from_perl($self);
+
+     } elsif( ref($self->{sx_sql_source}) eq "FileHandle") {
+        sx_grab_from_file($self);
+
      } else {
         sx_grab_from_sybase($self);
+
      }
 
 #summarize, restore env & exit
@@ -205,16 +219,27 @@ package Sybase::Xfer;
      dbmsghandle( $opt->{current_msg_handler} );
      dberrhandle( $opt->{current_err_handler} );
 
+#restore nsql deadlock retry logic
+     $Sybase::DBlib::nsql_deadlock_retrycount= $opt->{deadlock_retry};
+     $Sybase::DBlib::nsql_deadlock_retrysleep= $opt->{deadlock_sleep};
+     $Sybase::DBlib::nsql_deadlock_verbose   = $opt->{deadlock_verbose};
+
+
 #notification
      my $num_fails = $opt->{sx_err_count} - $opt->{sx_resend_count};
      unless( $opt->{silent} ) {
      
        sx_print($opt, "Xfer summary:\n");
-       sx_print($opt, "   $opt->{sx_succeed_count} total rows transferred\n");
-       sx_print($opt, "   $opt->{sx_err_count} total rows had errors\n") if $opt->{sx_err_count} > 0;
-       sx_print($opt, "   $opt->{sx_resend_count} total successful retries\n") if $opt->{sx_resend_count} > 0;
+       sx_print($opt, "   $opt->{sx_send_count} rows read from source\n");
+       sx_print($opt, "   $opt->{sx_succeed_count} rows transferred to target\n");
+       sx_print($opt, "   $opt->{sx_err_count} rows had errors\n") if $opt->{sx_err_count} > 0;
+       sx_print($opt, "   $opt->{sx_resend_count} total rows resent\n") if $opt->{sx_resend_count} > 0;
        sx_print($opt, "   $num_fails total unsuccessful retries\n") if $num_fails > 0;
      }
+
+#get rid of empty error file
+     my $fn = $opt->{error_data_file};
+     unlink $fn if $fn &&  -s $fn;
 
 #return.
      ($abort_error || $num_fails) ? return 1 : return 0;
@@ -343,10 +368,12 @@ package Sybase::Xfer;
 #$sql will be an arrayref when there are multiple batches in the from_sql/from_script
     if( ref($sql) eq "ARRAY" ) {
        for my $each_sql ( @{ $sql } ) {
+          sx_print($opt,"SQL:\n$each_sql\n") if $opt->{echo};
           $opt->{sx_dbh_from}->nsql($each_sql, [], $cb);
           $DB_ERROR && return;
        }
     } else {
+       sx_print($opt,"SQL:\n$sql\n") if $opt->{echo};
        $opt->{sx_dbh_from}->nsql($sql, [], $cb);
        $DB_ERROR && return;
     }
@@ -356,6 +383,38 @@ package Sybase::Xfer;
 
     return; 
   }
+
+#-----------------------------------------------------------------------
+#grab data from file and push to 'to' server
+#-----------------------------------------------------------------------
+  sub sx_grab_from_file {
+
+     my $self = shift;
+
+#remove the rows from target table, if called for.
+     sx_remove_target_rows($self) if $self->{auto_delete};
+
+#bcp init
+     my $nc = scalar keys %{ $self->{sx_to_info}->{ $self->{sx_to_database} }->{ $self->{sx_to_table} } };
+     $self->{sx_dbh_to_bcp} = sx_open_bcp($self->{to_table}, $self, $nc);
+
+#transfer the data by reading the file
+     my $delim = quotemeta $self->{from_file_delimiter};
+     my $fh = $self->{sx_sql_source};
+     while( my $line = <$fh> ) {
+        chomp $line; 
+        my $r_data = [ split /$delim/, $line ];
+        my $status = sx_sendrow_bcp($r_data, $self);
+        last unless( $status );
+     }
+
+#commit last set of rows
+     my $final_batch = sx_sendrow_batch($self);
+
+     return;
+  }
+
+
 
 
 #-----------------------------------------------------------------------
@@ -381,7 +440,7 @@ package Sybase::Xfer;
      }
 
 #commit last set of rows
-    my $final_batch = sx_sendrow_batch($opt);
+     my $final_batch = sx_sendrow_batch($opt);
 
      return;
   }
@@ -470,21 +529,28 @@ package Sybase::Xfer;
         $status_send = 0; 
      }
 
+#save the row iff error_handling == 'retry'
+     if( $opt->{error_handling} =~ /^retry/i ) {
+         push @{ $opt->{data_rows} }, {rn=>$opt->{sx_send_count}, row=>[@row]} 
+     }
+
 #check for failure on send
      if( !$status_send ) {
         $opt->{sx_err_count}++; 
         $opt->{sx_err_count_batch}++;
         $status_send = sx_sendrow_failure($opt, \@row);
      } else {
-        $opt->{sx_succeed_count}++; 
+#@        $opt->{sx_succeed_count}++; 
         $opt->{sx_succeed_count_batch}++;
      } 
 
 
 #commit
       $status_batch = 1;
-      if($opt->{sx_succeed_count} % $opt->{batchsize} == 0) {
+#@      if($opt->{sx_succeed_count} % $opt->{batchsize} == 0) {
+      if($opt->{sx_send_count} % $opt->{batchsize} == 0) {
          $status_batch = sx_sendrow_batch($opt);
+#@         $opt->{sx_succeed_count} += $status_batch; 
          $opt->{sx_send_count_batch} = 0; 
          $opt->{sx_resend_count_batch} = 0;
          $opt->{sx_succeed_count_batch} = 0; 
@@ -517,7 +583,8 @@ package Sybase::Xfer;
 
 #if user indicated retry status- then send the (fixed-up) row again!
          if($status_cb_err_send) { 
-            $opt->{sx_resend_count}++; $opt->{sx_resend_count_batch}++;
+            $opt->{sx_resend_count}++; 
+            $opt->{sx_resend_count_batch}++;
             my $rs = sx_sendrow_bcp($u_row, $opt);
             $DB_ERROR = ();   #clean-up error
             $status_send = 1; #force success
@@ -570,45 +637,190 @@ package Sybase::Xfer;
 #---
       if( !$status_batch ) {
              
-#a) call back exists
-          if( ref($opt->{callback_err_batch}) eq 'CODE'  && $opt->{error_handling} !~ /^abort$/i) {
-             my ($status_cb_err_batch) = $opt->{callback_err_batch}->(DB_ERROR => $DB_ERROR, 
-                                                                      row_num  => $opt->{sx_send_count});
-#change status_batch to success if err cb says so.
-             if($status_cb_err_batch) { 
-                $status_batch = 1; 
-                $DB_ERROR = ();
-             }
-#b) no callback
-          } else {
+#case on error handling
+#abort
+          if($opt->{error_handling} =~ /^abort$/i) {
              $DB_ERROR && sx_print($opt, "$DB_ERROR\n");
-          }
+       
+#continue or retry
+          } elsif($opt->{error_handling} =~ /^continue$/i || $opt->{error_handling} =~ /^retry/i) {
+
+
+#a) callback exists. returns status(1=resend batch, 0=abort batch) and a ref to the rows
+             my $cb = $opt->{callback_err_batch};
+             if( ref($cb) eq 'CODE' ) {
+                 my ($cb_status, $ref_row) = $cb->(DB_ERROR  => $DB_ERROR, 
+                                                   row_num   => $opt->{sx_send_count},
+                                                   rows      => \@{ $opt->{data_rows} },
+                                                   xfer_self => $opt);
+
+                 if($cb_status == 0) {
+                      $status_batch = 0;
+
+                 } elsif($cb_status > 0) {
+                      $status_batch = sx_sendrow_batch_of_size($opt, $ref_row, $cb_status);
+
+                 }
+
+                 $DB_ERROR = ();
+      
+
+#b) no callback
+             } else {
+                $status_batch = 0;
+                $DB_ERROR && sx_print($opt, "$DB_ERROR\n");
+                sx_print($opt, "bcp_batch error, -error_handling=$opt->{error_handling}, but no " .
+                         "-callback_err_batch defined\n");
+             }
+         }
+      
 #---
 #SUCCESS on batch
 #---
       } else {
+          $status_batch = sx_sendrow_batch_success($opt, $status_batch);
+
+      }
+
+#give back the storage
+       print scalar localtime() . " undefing\n" if $opt->{debug};
+       @{ $opt->{data_rows} } = undef;
+       print scalar localtime() . " done undefing\n" if $opt->{debug};
+
+      return $status_batch;
+   }
+
+
+#---
+#
+#---
+   sub bcp_batch_error_handler {
+
+#pull the args
+       my %h = @_;
+       my ($err, $line_num, $row_ref, $opt) = @h{qw/DB_ERROR row_num rows xfer_self/};
+
+#return code definitions:
+#      rc = 0  : abort
+#      rc = 1  : resend and batch a record at a time
+#      rc > 1  : resend but in one batch
+#
+       my $rc = 0;
+       my ($st, $md, $v) = @{$opt}{qw/retry_deadlock_sleep retry_max retry_verbose/}; 
+       my $nd = ++$opt->{sx_num_retry};
+       sx_print($opt,"\nError detected on bcp_batch. Retry #$nd (max_retries=$md)\n") if $v;
+
+#check retry number
+       if($nd > $md) {
+          sx_print($opt, "max retries. aborting only this batch.\n\n") if $v;
+          $rc = 0;
+
+       } else {
+
+#deadlock error.
+          my $deadlock if $err =~ /^Message: 1205/m;
+          if($deadlock) { 
+              sx_print($opt,"It's a deadlock error! ") if $v; 
+              sx_print($opt, "sleeping for $st seconds.\n") if $v;
+              sleep $st;
+              $rc = 2; #force no one-by-one error reporting
+
+#not a deadlock error. 
+           } else {
+              $rc = 1; #one at a time
+#@            $rc = 2; #testing
+
+           }
+       }
+       return ($rc, $row_ref);
+   }
+
+
+
+#----
+#resubmit the row
+#-----
+   sub sx_sendrow_batch_of_size {
+
+       my $opt = shift;
+       my $r_rows = shift;
+       my $new_batchsize = shift;
+
+       my $rcount = 0;
+       my $elf = $opt->{sx_error_data_file_fh};
+       my $dbh = $opt->{sx_dbh_to_bcp};
+       foreach my $hp ( @{ $r_rows} ) {
+          my ($rn, $row) = ($hp->{rn}, $hp->{row});
+          $rcount++;
+          $opt->{sx_resend_count}++; 
+          $opt->{sx_resend_count_batch}++;
+
+#send row again
+          if($dbh->bcp_sendrow($row) == FAIL) {
+             local($") = "|";
+             print $elf "#recnum=$rn, reason=$DB_ERROR_ONELINE\n@$row\n";
+             next;
+          }
+
+#batch one by one only if batchsize is 1
+          if($new_batchsize == 1) {
+             my $status = $dbh->bcp_batch();
+             if($status != 1) { 
+                $opt->{sx_err_count}++;
+                $opt->{sx_err_count_batch}++;
+                local($") = "|";
+                print $elf "#recnum=$rn, reason=$DB_ERROR_ONELINE\n@$row\n";
+             } 
+          } 
+       }
+
+       my $num_good = ();
+       if($new_batchsize == 1) {
+          $num_good = $opt->{sx_resend_count_batch} - $opt->{sx_err_count_batch};
+          sx_sendrow_batch_success($opt, $num_good); #log message
+
+       } else {
+          sx_sendrow_batch_success($opt, $num_good); #log message
+          $num_good = sx_sendrow_batch($opt);
+       }
+ 
+#log message
+       return $num_good;
+#       return   sx_sendrow_batch_success($opt, $num_good);
+   }
+
+
+#-----
+#
+#-----
+   sub sx_sendrow_batch_success {
+
+          my $opt = shift;
+          my $status_batch = shift;
+         
+
+          my $send_count = $opt->{sx_send_count};
+          $opt->{sx_succeed_count} += $status_batch;
           if($opt->{progress_log}) {
              my $suc = $opt->{sx_succeed_count};
              my $res = $opt->{sx_resend_count};
              my $fal = $opt->{sx_err_count} - $res;
              my $bsuc= $opt->{sx_succeed_count_batch};
              my $bres= $opt->{sx_resend_count_batch};
-             my $bfal= $opt->{sx_err_count_batch} - $bres;
+             my $bfal= $opt->{sx_err_count_batch};
 
 #if errors encountered then give a different log message. otherwise keep it simple
              $opt->{override_silent}=1;
              if($res) {
-               sx_print($opt, "$status_batch rows committed [$suc] (retries=$bres, fails=$bfal)\n");
+               sx_print($opt, "$status_batch rows committed [$suc/$send_count] (retries=$bres, fails=$bfal)\n");
              } else {
                sx_print($opt, "$status_batch rows committed [$suc]\n");
              }
              $opt->{override_silent}=0;
           }
-      }
 
-
-      return $status_batch;
-   }
+          return  $status_batch;
+  }
 
 
 #-----------------------------------------------------------------------
@@ -699,7 +911,8 @@ package Sybase::Xfer;
 
 
      } elsif($opt->{from_script}) {
-        open(FH1,"<$opt->{from_script}") or sx_complain("unable to open script: <$opt->{from_script}>\n");
+        my $fn = $opt->{from_script};
+        open(FH1,"<$fn") or sx_complain("unable to open script: <$fn>, $!\n");
         my @lines = <FH1>;
         close(FH1);
         $sql_source = join "", @lines;
@@ -711,6 +924,10 @@ package Sybase::Xfer;
      } elsif( ref( $opt->{from_perl} ) eq "CODE" ) {
         $sql_source = $opt->{from_perl};
 
+     } elsif( $opt->{from_file}) {
+        my $fn = $opt->{from_file};
+        $sql_source = new FileHandle "<$fn" or sx_complain("unable to open file: <$fn>, $!\n");
+
      }
 #squirrel it away
      $opt->{sx_sql_source} = $sql_source;
@@ -721,6 +938,7 @@ package Sybase::Xfer;
      my $dbh_to_non_bcp = new Sybase::DBlib($opt->{to_user}, $opt->{to_password}, 
                           $opt->{to_server}, $opt->{app_name}.'_X');
      $DB_ERROR && sx_complain("TO login error:\n$DB_ERROR\n");
+     $dbh_to_non_bcp->nsql("set flushmessage on");
 
     
 #check that -to_table exists
@@ -744,8 +962,9 @@ package Sybase::Xfer;
      $opt->{sx_dbh_to_non_bcp} = $dbh_to_non_bcp;
  
 #check if delete flag specified
-     if($opt->{delete_flag} && $opt->{where_clause} ) {
-        my $del_line = "delete $opt->{to_table} where $opt->{where_clause}";
+     if($opt->{delete_flag}) {
+        my $del_line = "delete $opt->{to_table}"; 
+        $del_line .= " where $opt->{where_clause}" if $opt->{where_clause};
         my $sql_string = sx_delete_sql($del_line, $opt->{batchsize});
         sx_print($opt, "delete table $opt->{to_server} : $opt->{to_table}\n") if($opt->{echo});
         sx_print($opt, "   $del_line (in a loop)\n") if($opt->{echo});
@@ -863,7 +1082,7 @@ package Sybase::Xfer;
          $col_num--;
          push @{ $opt->{sx_ad_col_num} }, $col_num;
 
-#add delimeters
+#add delimiters
          if($type =~ /date|time/i) {  
             $val = qq/$cname = '\${row[$col_num]}'/;
             $ctype = $type;
@@ -983,7 +1202,7 @@ EOF
       my %opt = sx_verify_options(@user_options);
 
 #if help, then give usage and bail
-      sx_usage(), exit 1 if defined $opt{help};
+      sx_usage(), exit 1 if(defined $opt{help} || !@ARGV);
       
 
 #if "U" specified, then make from and to equal to "user"
@@ -1024,19 +1243,44 @@ EOF
       }
 
 #error handling
-      if(defined $opt{error_handling} && ! $opt{error_handling} =~ m/^(continue|abort)$/i) {
-         sx_complain("if -error_handling is specified it must be either 'continue' or 'abort'\n");
+      if(defined $opt{error_handling} && ! $opt{error_handling} =~ m/^(continue|abort|retry)/i) {
+         sx_complain("if -error_handling is specified it must be either abort/continue/retry\n");
       }
       $opt{error_handling} = 'abort' unless defined $opt{error_handling};
-    
+      if($opt{error_handling} =~ /retry/i ) {
+         $opt{callback_err_batch} = \&bcp_batch_error_handler unless $opt{callback_err_batch};
+         sx_complain("Must specify -error_data_file if -error_handling = 'retry'\n") unless($opt{error_data_file});
+      }
+       my $fn = $opt{error_data_file};
+       $opt{sx_error_data_file_fh} = new FileHandle ">$fn" || sx_complain("Can't open <$fn> $!\n");
+
+     $opt{retry_max} = defined $opt{retry_max} ? $opt{retry_max} : 3;
+     $opt{retry_deadlock_sleep} = defined $opt{retry_deadlock_sleep} ? $opt{retry_deadlock_sleep} : 120;
+     $opt{retry_verbose} = defined $opt{progress_log} ? $opt{progress_log} : 1;
+
+#set  nsql deadlock retry logic
+     $opt{save_deadlock_retry} = $Sybase::DBlib::nsql_deadlock_retrycount;
+     $opt{save_deadlock_sleep} = $Sybase::DBlib::nsql_deadlock_retrysleep;
+     $opt{save_deadlock_verbose} = $Sybase::DBlib::nsql_deadlock_verbose;
+     $Sybase::DBlib::nsql_deadlock_retrycount= defined $opt{retry_max} ? $opt{retry_max} : 3;
+     $Sybase::DBlib::nsql_deadlock_retrysleep= defined $opt{retry_deadlock_sleep} ? $opt{retry_deadlock_sleep} : 120;
+     $Sybase::DBlib::nsql_deadlock_verbose   = defined $opt{verbose} ? $opt{verbose} : 1;
 
 #check for omissions
-      sx_complain("Must specify <from server>\n") unless($opt{from_server} || $opt{from_perl} );
+      sx_complain("Must specify from source - server, perl, or file\n") unless($opt{from_server} || $opt{from_perl} || $opt{from_file});
       sx_complain("Must specify <to server>\n") unless $opt{to_server};
       sx_complain("Must specify <to table>, use db..table syntax for safety.\n") unless $opt{to_table};
-      unless ($opt{from_table} || $opt{from_script} || $opt{from_sql} || $opt{from_perl} ) {
-        sx_complain("Must specify <-from table>, <-from_script>, <-from_sql>, or <-from_perl>\n");
+      unless ($opt{from_table} || $opt{from_script} || $opt{from_sql} || $opt{from_perl} || $opt{from_file}) {
+        sx_complain("Must specify <-from table>, <-from_script>, <-from_sql>, <-from_perl>, or <-from_file>\n");
       }
+
+#from_file checks
+      if($opt{from_file} && !$opt{from_file_delimiter}) {
+         sx_complain("Must specify -from_file_delimiter (-ffd) if -from_file is specified\n");
+      } elsif($opt{from_file_delimiter} && !$opt{from_file}) {
+         sx_complain("Must specify -from_file if -from_file_delimiter is specified\n");
+      }
+ 
 
 #default scratch db
       $opt{scratch_db} = 'tempdb' unless $opt{scratch_db};
@@ -1096,6 +1340,8 @@ EOF
                         from_script=s
                         from_sql=s
                         from_perl=s
+                        from_file|ff=s
+                        from_file_delimiter|ffd=s
 
                         to_server|ts=s
                         to_user|tu=s
@@ -1113,7 +1359,6 @@ EOF
                         truncate_flag|tf:s
                         where_clause|wc=s
                         batchsize|bs=i
-                        error_handling|eh=s
                         holdlock|hl!
                         trim_whitespace|tw!
                        
@@ -1124,12 +1369,17 @@ EOF
                         debug=s
                         echo:s
                         silent:s
-                        progress_log:s
+                        progress_log|verbose:s
                         app_name|an=s
                         
-                        callback_pre_send=s
+                        error_handling|eh=s
+                        error_data_file|edf=s
+                        retry_max=s
+                        retry_deadlock_sleep|rds=s
+
                         callback_err_send=s
                         callback_err_batch=s
+                        callback_pre_send=s
                         callback_print=s
                      /;
 
@@ -1250,6 +1500,7 @@ EOF
          foreach my $row ( split(/\n/,$db->dbstrcpy) ) {
              $DB_ERROR .= sprintf ("%5d", $lineno ++) . "> $row\n";
          }
+         $DB_ERROR_ONELINE = "$message $text";
 
 #force nosilent on errors.
          $opt->{override_silent}++;
@@ -1392,6 +1643,14 @@ string is the filename containing sql to run
 
 coderef is perl sub to call to get data
 
+=item -from_file | -ff (filename)
+
+name of file to read data from.
+
+=item -from_file_delimiter | -ffd (delimiter)
+
+the delimiter used to separate fields. Used in conjunction with -from_file only.
+
 =back
 
 =head2 TO INFO
@@ -1522,7 +1781,20 @@ any output that normally goes to stdout callback
 
 =item -error_handling| -eh (string)
 
-I<string> is B<abort> or B<continue>. Default is B<abort>.
+I<string> is B<abort>, B<continue>, or B<retry>. Default is B<abort>.
+
+=item -error_data_file | -edf (filename)
+
+name of file to write the failed records into
+
+=item -retry_max n
+
+number of times to retry an bcp_batch error
+
+=item -retry_deadlock_sleep
+
+sleep time between calls to bcp_batch if deadlock error detected
+
 
 =back
 
@@ -1574,6 +1846,14 @@ user routine must return the following array: ($status, $array_ref)  where $stat
 end the transfer. $arrary_ref is an array refernce to the row to send. This switch is only available from the API for
 obvious reasons.
 
+ -from_file <file>
+
+the file to read the actual data from. It must be a delimited file. Using this option it behaves simliar
+to Sybase::BCP (in) and Sybase's own bcp. I've attempted to make the error handling richer.
+
+ -from_file_delimiter <regex>
+
+the delimiter to use to split each record in -from_file. Can be a regular expression.
 
 =head2 from information
 
@@ -1670,7 +1950,8 @@ under a different user name) before you run the transfer. Default is false.
  -delete_flag | -df     
 
 send 'delete I<to_table> [where I<where_clause>]' to the I<to_server> before the transfer 
-begins. Also see -where_clause. Default is false.
+begins. Also see -where_clause. Default is false.  The delete will be performed in 
+batches in  the size given by -batch_size.
 
 
  -app_name | -an <val>    
@@ -1753,25 +2034,50 @@ It's called like this: $opt->{callback_print}->($message)
 
 =head2 error handling
 
-What to do upon encountering an error?
+What to do upon encountering an error on bcp_sendrow or bcp_batch?
 
  -error_handling | -eh  <value>
 
-Value can be B<abort> or B<continue> only. I should probably have a threshold number but
+Value can be B<abort>, B<continue> or B<retry>. I should probably have a threshold number but
 I'll leave that until a later time.  When set to B<continue> the transfer will proceed 
 and call any error callbacks that are defined (see below) and examine the return status of those
 to decide what to do next. If no error callbacks are defined and -error_handling set
 to B<continue> the module will print the offending record by describing the row by
 record number, column-types and data values and continue to the next record. If -error_handling
 is set to B<abort>, the same is printed and the xfer sub exits with a non-zero return
-code.
+code. 
+
+When value is B<retry> it attempts to behave like Sybase::BCP on error in bcp_batch. These 
+are where server errors are detected, like duplicate key or deadlock error. 
+
+By default, when -error_handling = B<retry>
+
+=over 5
+
+=item * 
+
+if a deadlock error is detected on the bcp_batch the program will sleep for 
+-retry_deadlock_sleep seconds and rerun bcp_sendrow for all the rows in the batch
+and rerun bcp_batch once and repeat until no deadlock error or max tries.
+
+=item * 
+
+if a non-deadlock error is detected on the bcp_batch the program will attempt to behave
+like Sybase::BCP by bcp_sendrow'ing and bcp_batch'ing every record. Those in error are written
+to the -error_data_file.
+
+=back
+
 The default is B<abort>.
 
 Here's a deliberate example of a syntax type error and an example of the output 
-from the error_handler:
+from the error_handler. Note This is detected on bcp_sendrow. See below for bcp_batch 
+error trace.
 
- Sybase error: Attempt to convert data stopped by syntax error in source field.
- 
+ #------
+ #SAMPLE BCP_SENDROW ERROR FORMAT
+ #------
+
  row #1
      1: ID                       char(10)        <bababooey >
      2: TICKER                   char(8)         <>
@@ -1803,37 +2109,85 @@ from the error_handler:
    error_handling = abort
  1 rows read before abort
 
+ #------
+ #SAMPLE BCP_BATCH ERROR_FILE
+ #------
+if B<-error_handling> = I<retry> and an error occurs on the bcp_batch then the -error_data_file will
+have this format.
+
+ #recnum=1, reason=2601 Attempt to insert duplicate key row in object 'sjs_junk1' with unique index 'a'
+ mwd|20010128|10.125
+ #recnum=2, reason=2601 Attempt to insert duplicate key row in object 'sjs_junk1' with unique index 'a'
+ lnux|20010128|2.875
+ #recnum=3, reason=2601 Attempt to insert duplicate key row in object 'sjs_junk1' with unique index 'a'
+ scmr|20010128|25.500
+ #recnum=4, reason=2601 Attempt to insert duplicate key row in object 'sjs_junk1' with unique index 'a'
+ qcom|20010128|84.625
+
+
+ -retry_max <n>
+
+n is the number of times to retry a bcp_batch when an error is detected. default is 3.
+
+ -retry_deadlock_sleep <n>
+
+n is the number of secords to sleep between re-running a bcp_batch when a deadlock error
+is detected.
 
 
  -callback_err_send <code_ref | hash_ref>
 
-sub to call if error detected on bcp sendrow. The module pases a hash as you
-see below. It expects and 2 element array in return  ie. ($status, \@row).
+sub to call if error detected on bcp sendrow. The module passes a hash as
+seen below. It expects a 2 element array in return  ie. ($status, \@row).
 $status true means continue, $status false means abort.
 Can also be a hash_ref meaning to store the error rows keyed by row number.
 
- 
-
 It's called like this if I<code_ref>.  @row is the array of data:
 
-     $opt->{callback_err_send}->(DB_ERROR => $DB_ERROR,
-                                 row_num  => $row_rum,
-                                 row_ptr  => \@row );
+     your_err_sendrow_cb(DB_ERROR => $DB_ERROR,
+                         row_num  => $row_rum,
+                         row_ptr  => \@row );
 
-It must return this:  return ($status, \@row);
+It must return this:  
+
+    return ($status, \@row);
 
 It stores the error like this if I<hash_ref>:
 
-     ${ $opt->{callback_err_send} }{ $row_num }->{msg} = $DB_ERROR;
-     ${ $opt->{callback_err_send} }{ $row_num }->{row} = \@row;
+     $your_hash{ $row_num }->{msg} = $DB_ERROR;
+     $your_hash{ $row_num }->{row} = \@row;
 
 
 
 
- -callback_err_batch <ref>
+ -callback_err_batch <coderef>
 
-sub to call if error detected on bcp batch. Not implemented.
+sub to call if an error detected on bcp_batch. The module passes a hash as
+seen below. It expects a 2 element array in return. ie. ($status, \@row).
 
+$status == 0 indicates to abort the batch. 
+
+$status == 1 indicates to resend and batch a row at a time and report 
+errors to -error_data_file. 
+
+$status > 1 indicates not to do a record by record send and batch but to resend
+and batch once.
+
+It's called like this:
+
+     your_err_batch_cb(DB_ERROR  => $DB_ERROR, 
+                       row_num   => $row_num,
+                       rows      => \@row)
+
+It must return this:  
+
+           return ($status, \@row);
+
+A word about @row above. It's got a tad more info in it.  @row is a array
+of hash refs. where:
+
+  $row[$i]->{rn}  == row number in input file,
+  $row[$i]->{row} == the actual array of data
 
 
 =head2 miscellaneous boolean flags
@@ -2053,19 +2407,16 @@ Create the -to_table on the fly if it doesn't exist.
 
 =item *
 
-Incorporate more of Michael Peppler's features of Sybase::BCP like pushing all the
-rows except the bad ones of a batch into the target table. I got my eye on his 
-code but it'll have to wait to the next release. :)
-
-=item *
-
-When the -delete_flag is specified perform the delete in loop of bathsize rows 
-(instead of just running a naked delete command)
-
-=item *
-
 Incorporate logic to do the right thing when transferring data between Unicode and
 ISO versions of the Sybase server.
+
+=item *
+
+Allow DBlib handle to be passed in lieu of from_user/from_pwd/from_server
+
+=item *
+
+add option to drop indices before bcp and re-create indices after bcp.
 
 =back
 
@@ -2076,7 +2427,7 @@ ISO versions of the Sybase server.
 
 =item * 
 
-Error handling and reporting could be better. 
+Deadlock retry features need to more thoroughly tested.
 
 =back
 
@@ -2114,7 +2465,8 @@ Sybase::Xfer idea inspired by Mikhail Kopchenov.
 
 =head1 VERSION
 
-Version 0.1, 01-OCT-2000
+Version 0.20, 12-DEC-2000
+Version 0.30, 10-FEB-2000
 
 =cut
 
