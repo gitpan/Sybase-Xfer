@@ -1,7 +1,7 @@
 #
 #extract name, type, len from a sybase database given a list of tables
 #
-# $Id: ObjectInfo.pm,v 1.5 2001/02/11 17:53:54 spragues Exp spragues $
+# $Id: ObjectInfo.pm,v 1.6 2001/02/26 04:06:55 spragues Exp $
 #
 # (c) 1999, 2000 Morgan Stanley Dean Witter and Co.
 # See ..../src/LICENSE for terms of distribution.

@@ -1,13 +1,25 @@
 QUICK DESCRIPTION
-  Bulk copies data into a Sybase table.  Data  sources  can  include  a)
-  another Sybase table, b) the  results  of  any  Transact-Sql,  c)  the
-  return values from a perl subroutine called repetitively, or d) a flat
-  file. An attempt is made to make error reporting/handling/intercepting
-  more accessible. One option worth  noting  here  is  -auto_delete.  It
-  instructs the module to only delete the rows you're about to insert.
+ Bulk copies data into a Sybase  table.  Data  sources  can  include  a)
+ another Sybase table, b) the results of any sql, c) the  return  values
+ from a perl subroutine called repetitively, or d) a  flat  file.  Comes
+ with robust error reporting, handling, and intercepting and  perl  call
+ back hooks to intercept  data  before  it's  sent  to  the  server  and
+ after (if errors.)
+ 
+ Also comes with a command line wrapper, sybxfer.
 
-  Also comes with a command line wrapper, sybxfer.
-        
+SYNOPSIS
+ #!/usr/bin/perl
+    use Sybase::Xfer;
+    my %switches = (-from_server=>'CIA', -to_server=>'NSA', -table => 'x-files');
+    my $h = Sybase::Xfer->new( %switches );
+    my %status = $h->xfer(-return=>"HASH");
+    print "xref failed. $status{last_error_msg}\n" unless $status{ok};
+ 
+ #!/bin/ksh
+    sybxfer -from_server 'CIA' -to_server 'NSA' -table 'x-files'  
+    if [[ $? != 0 ]]; then print "transfer problems"; fi
+
 
 INSTALLATION (the usual)
    perl Makefile.PL [ LIB=<alternate installation> ]
@@ -23,119 +35,84 @@ DEPENDENCIES
       Sybase::DBlib
 
 
-SYNOPSIS
-   #from perl
-      #!/usr/bin/perl5.005
-      use Sybase::Xfer;
-      $h = new Sybase::Xfer( %options );
-      $h->xfer();
-      $h->done();
-
-   #from shell
-      #!/usr/ksh
-      sybxfer <options> 
- 
-
 CONTACTS
-   my e-mail: stephen.sprague@msdw.com 
+   my e-mail: stephen.sprague@morganstanley.com
 
 
 
 CHANGE LOG:
 ------------------------
-Version .40  01-mar-2001
+Version 0.51  15-jun-2001
 ------------------------
-* new defaults
-     -U and -P default to $ENV{USER}, -S defaults to $ENV{DSQUERY}
+* added -to_database documentation (Suresh Balakrishnan)
 
-* more concise usage
-    -help will invoke a short help,  '-help more' will invoke a 
-    slightly more expanded help
+* added use 5.005. (Merijn Broeren)
 
-* list return context for method xfer
-    if method xfer called in list context it will return 
-    (num_rows_read, num_rows_transferred, last_error_detected)
-    
-# new switch -from_file_map (-ffm) 
-    allows re-arranging of fields in -from_file to columns
-    in -to_table
+* added new option -timeout [secs] (Ron Isaacson)
 
-* float/int syntax error focus
-    the smart error reporting expanded to include float and
-    int checks when sybase just indicates a "syntax error".
+* added new option,
+  -drop_and_recreate_indices | dari [syts:server.database]
+  instructs xfer to drop the indices on the target table 
+  before the transfer begins and to recreate them after
+  the transfer is complete. 
 
-* the module no longer exits anywhere
-     Where it exited before it now returns with a unsuccessful
-     return code.
-   
-* tweaked the output of -progress_log a little.
+* defined scalar return context of method xfer as follows:
+  0 = success w/o any hitches
+ >0 = success w/ n number of rows not transferred
+ -1 = aborted. unrecoverable error
+ -2 = aborted. interrupt signal
+ -3 = aborted. timeout signal
 
+* added above scalar return code as 4th element to 
+  list return context. ie. array is as follows:
+  [0] = num rows read from source
+  [1] = num rows transferred to target
+  [2] = last known error message
+  [3] = scalar return code
 
-------------------------
-Version .31  12-feb-2001
-------------------------
-* Fixed sloppy bug left in v.30 where if @ARGV is empty it'd  print  a
-  usage statment. Duh! That  holds  for  the  script  sybxfer  but  it
-  doesn't hold user written scripts.
+* new switch added. -return=> 'HASH' | 'ARRAY' | 'SCALAR'
+  default is SCALAR if called in scalar context and 
+  ARRAY if called in list context. This is backward
+  compatible default behavior. However, if HASH is specified
+  the method will now return:
+    {rows_read}        = number of rows read from target  
+    {rows_transferred} = number of rows transferred to target
+    {last_error_msg}   = last error message encountered   
+    {scalar_return}    = scalar return. see above.
+    {ok}               = 1 if all rows were transferred regardless
+                         of retries or warnings along the way.
+                       = 0 if not
 
+* added 'Xfer info' portion to std out. This echoes
+  -from_table, -to_table and logs pre-xfer activities
+  like deleting rows, truncating table, dropping indices
+  etc.
 
-------------------------
-Version .30  11-feb-2001
-------------------------
+* can now specify -to_table as:
+  [source.][server.][database.][owner.][table]
+  where source = 'Sybase' is the only supported source right
+  now. -to_table settings override -to_server, -to_database
+  settings. 
 
-Some promised mods.
+* fixed double mapping bug when using -from_file_map. Also,
+  can now use -from_file_map with any source.
 
-* New/modified switches as follows:
+* fixed bug with -retry_verbose (Ilya Shulimovich)
 
-        -error_handling 'continue|abort|retry'
-           added value 'retry'. Will behave like Sybase::BCP upon  error
-           on bcp_batch. In other words, set  the  batchsize  to  1  and
-           resend the data. Prints failed  records  to -error_data_file.
-           (thanks to Michael Peppler for allowing me to raid his code.)
-   
-        -retry_max 'n'
-           number of times to  retry  a  failed  bcp_batch.  Default  is
-           three.
+* fixed bug when using -from_file and
+  file had trailing null fields. (Thomas Boccafola)
 
-        -retry_deadlock_sleep 'sec'
-           number of seconds to  sleep  between  sending  the  bcp_batch
-           again iff a deadlock error is detected. Default is 120.
+* rigorous deadlock testing performed by Ilya Shulimovich (i think)
 
-        -callback_err_batch 'coderef'
-           implemented it. Now users can modify the rows  in  the  batch
-           and request that xfer resend it or not. Default is Xfer's own
-           routine   that   implements   the   most   useful   behaviour
-           (hopefully.)
+* huge thanks to Ron Isaacson for enlightening me on many
+  various perl oddities and for volunteering to help me 
+  with more releases of this module. Hell, he's even starting
+  in own xfer module that'll stretch past this one.
 
-        -error_data_file | -edf <filename>
-           contains records that  failed  to  transfer  in  addition  to
-           source record number and Sybase erorr message for each record
-           that failed.
-            
-        -from_file | -ff <filename>
-           new source. Take the  data  from  a  flat  file.  Must  be  a
-           delimited file. Steals a chapter from Sybase's bcp.
-
-        -from_file_delimiter | -ffd  <regex for delimiter>
-           used inconjunction with with -from_file. The delimeter can be
-           regular expression. (similiar to -t switch in Sybase's bcp)
-             
-        -holdlock
-           if switch -from_table specified then this  switch  appends  a
-           'holdlock' to internally generated  select  statement.  
-
-        -app_name <name>
-           sets the program_name in master..sysprocesses table. Defaults
-           to the script name. 
-
-        -delete_flag 
-           modified such that rows are deleted in -batchsize increments
-           so the log doesn't get blown.
-
-* changed the final summary message slightly to report:
-    1) num rows read from source
-    2) num rows resent to target table (only if errors)
-    3) num rows failed to be transferred
-
-
-* if no args given it'll exit gracefully with a message to run perldoc
+* documentation on error handling expanded. 
+  
+* added documentation in the bugs section that -to_tables
+  residing on Sybase Openserver's are not supported for the
+  target table.
+  (Peter Somu)
+  
